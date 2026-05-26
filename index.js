@@ -98,6 +98,8 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
   });
 
   console.log(`✅ Haupt-Order platziert`);
+  await new Promise(r => setTimeout(r, 3000));
+
 
   // TP Orders platzieren
   if (targets && targets.length > 0) {
