@@ -254,14 +254,12 @@ Für Breakeven Signal: { "signal": true, "action": "breakeven", "asset": "BTC", 
 Falls kein Signal: { "signal": false }
 
 Regeln:
+- Das Asset ist das ERSTE WORT vor Long/Short (z.B. "Hype Long" = asset: "HYPE", "BTC long" = asset: "BTC")
+- Asset immer in GROSSBUCHSTABEN
 - Extrahiere ALLE TPs (auch aus Bildern)
 - targets ist Array mit TP Preisen als Zahlen
 - entry, stopLoss sind Zahlen oder null
 - Confidence ist Hoch nur wenn SL erkennbar ist`
-- Confidence ist Hoch nur wenn SL erkennbar ist
-- Das Asset ist meist das ERSTE WORT der Nachricht vor Long/Short (z.B. "Hype Long" → asset: "HYPE")
-- Asset häufig in GROSSBUCHSTABEN oder 3-4 Stelligen Abkürzungen
-
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
@@ -478,6 +476,11 @@ client.on('messageCreate', async (message) => {
     }
 
     if (signal.confidence === 'Niedrig' || !signal.stopLoss) return;
+
+    if (!signal.asset) {
+      console.log(`⏭️ Kein Asset erkannt – übersprungen`);
+      return;
+    }
 
     await setLeverage(signal.asset);
     await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.targets);
