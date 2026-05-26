@@ -113,13 +113,13 @@ const tpBody = JSON.stringify({
   marginCoin: 'USDT',
   side: direction === 'Long' ? 'sell' : 'buy',
   tradeSide: 'close',
-  orderType: 'limit',
+  orderType: 'market',
   size: tpSize,
   triggerPrice: tp.price.toString(),
   triggerType: 'mark_price',
-  executePrice: tp.price.toString(),
   planType: 'normal_plan'
 });
+
 
 const tpPath = '/api/v2/mix/order/place-plan-order';
       await axios.post(`https://api.bitget.com${tpPath}`, tpBody, {
