@@ -258,6 +258,10 @@ Regeln:
 - targets ist Array mit TP Preisen als Zahlen
 - entry, stopLoss sind Zahlen oder null
 - Confidence ist Hoch nur wenn SL erkennbar ist`
+- Confidence ist Hoch nur wenn SL erkennbar ist
+- Das Asset ist meist das ERSTE WORT der Nachricht vor Long/Short (z.B. "Hype Long" → asset: "HYPE")
+- Asset häufig in GROSSBUCHSTABEN oder 3 Stelligen Abkürzungen
+
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
