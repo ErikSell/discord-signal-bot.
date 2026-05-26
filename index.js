@@ -21,6 +21,14 @@ let waitingForRisk = false;
 
 const tg = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+tg.on('polling_error', (error) => {
+  console.error('TG Polling Error:', error.message);
+  if (error.message.includes('401') || error.message.includes('Unauthorized')) {
+    console.error('❌ Telegram Token ungültig – polling gestoppt');
+    tg.stopPolling();
+  }
+});
+
 async function notify(msg) {
   try {
     await tg.sendMessage(TELEGRAM_CHAT_ID, msg, { parse_mode: 'HTML' });
@@ -85,12 +93,13 @@ async function getSizePrecision(symbol) {
 
 async function getBalance() {
   const timestamp = Date.now().toString();
-  const path = '/api/v2/mix/account/account';
-  const queryString = '?symbol=USDT&productType=USDT-FUTURES&marginCoin=USDT';
+  const path = '/api/v2/mix/account/accounts';
+  const queryString = '?productType=USDT-FUTURES';
   const r = await axios.get(`https://api.bitget.com${path}${queryString}`, {
     headers: bitgetGetHeaders(timestamp, path, queryString)
   });
-  return r.data.data;
+  const usdt = r.data.data.find(a => a.marginCoin === 'USDT');
+  return usdt;
 }
 
 async function getPositions() {
@@ -267,8 +276,6 @@ Regeln:
   return JSON.parse(raw);
 }
 
-// ─── Telegram Commands ─────────────────────────────────────
-
 tg.onText(/\/h/, (msg) => {
   tg.sendMessage(msg.chat.id, `
 📖 <b>Commands Übersicht</b>
@@ -432,8 +439,6 @@ tg.on('message', (msg) => {
     }
   }
 });
-
-// ─── Discord Bot ───────────────────────────────────────────
 
 client.on('ready', async () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
