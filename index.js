@@ -113,16 +113,16 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
 
       const tpTimestamp = Date.now().toString();
       const tpBody = JSON.stringify({
-        symbol: fullSymbol,
-        productType: 'USDT-FUTURES',
-        marginCoin: 'USDT',
-        size: tpSize,
-        side: closeSide,
-        tradeSide: 'close',
-        orderType: 'limit',
-        price: tp.price.toString()
-      });
-
+  symbol: fullSymbol,
+  productType: 'USDT-FUTURES',
+  marginMode: 'isolated',
+  marginCoin: 'USDT',
+  size: tpSize,
+  side: closeSide,
+  tradeSide: 'close',
+  orderType: 'limit',
+  price: tp.price.toString()
+});
       const tpPath = '/api/v2/mix/order/place-order';
       await axios.post(`https://api.bitget.com${tpPath}`, tpBody, {
         headers: bitgetHeaders(tpTimestamp, tpPath, tpBody)
