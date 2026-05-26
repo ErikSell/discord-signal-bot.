@@ -9,7 +9,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const BITGET_API_KEY = process.env.BITGET_API_KEY;
 const BITGET_SECRET = process.env.BITGET_SECRET;
 const BITGET_PASSPHRASE = process.env.BITGET_PASSPHRASE;
-const TRADE_SIZE_USD = 5;
+const TRADE_SIZE_USD = 10;
 const LEVERAGE = '1';
 
 function createSignature(timestamp, method, requestPath, body) {
