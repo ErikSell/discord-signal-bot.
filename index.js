@@ -13,6 +13,8 @@ const RISK_USD = 1;
 const MAX_POSITION_USD = 100;
 const LEVERAGE = '1';
 
+// ─── Hilfsfunktionen ───────────────────────────────────────
+
 function createSignature(timestamp, method, requestPath, body) {
   const message = timestamp + method + requestPath + (body || '');
   return crypto.createHmac('sha256', BITGET_SECRET).update(message).digest('base64');
@@ -29,6 +31,19 @@ function bitgetHeaders(timestamp, path, body) {
     'locale': 'en-US'
   };
 }
+
+function getTPDistribution(count) {
+  const distributions = {
+    1: [100],
+    2: [60, 40],
+    3: [50, 30, 20],
+    4: [40, 25, 20, 15],
+    5: [30, 25, 20, 15, 10]
+  };
+  return distributions[count] || distributions[5];
+}
+
+// ─── Bitget API Calls ──────────────────────────────────────
 
 async function getPrice(symbol) {
   const response = await axios.get('https://api.bitget.com/api/v2/mix/market/ticker', {
@@ -51,39 +66,73 @@ async function setLeverage(symbol) {
   });
 }
 
-async function placeOrder(symbol, direction, stopLoss, takeProfit) {
-  const timestamp = Date.now().toString();
+async function placeOrder(symbol, direction, stopLoss, targets) {
   const fullSymbol = symbol + 'USDT';
   const price = await getPrice(symbol);
 
+  // Positionsgröße berechnen
   const riskPerUnit = Math.abs(price - stopLoss);
-  let size = RISK_USD / riskPerUnit;
-  const notional = size * price;
-  if (notional > MAX_POSITION_USD) size = MAX_POSITION_USD / price;
-  size = size.toFixed(4);
+  let totalSize = RISK_USD / riskPerUnit;
+  const notional = totalSize * price;
+  if (notional > MAX_POSITION_USD) totalSize = MAX_POSITION_USD / price;
 
-  console.log(`📐 Size: ${size} ${symbol} | Notional: $${(parseFloat(size) * price).toFixed(2)}`);
+  console.log(`📐 Total Size: ${totalSize.toFixed(4)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
 
-  const orderBody = {
+  // Haupt-Order platzieren
+  const mainBody = JSON.stringify({
     symbol: fullSymbol,
     productType: 'USDT-FUTURES',
     marginMode: 'isolated',
     marginCoin: 'USDT',
-    size,
+    size: totalSize.toFixed(4),
     side: direction === 'Long' ? 'buy' : 'sell',
     tradeSide: 'open',
-    orderType: 'market'
-  };
-
-  if (stopLoss) orderBody.presetStopLossPrice = stopLoss.toString();
-  if (takeProfit) orderBody.presetStopSurplusPrice = takeProfit.toString();
-
-  const body = JSON.stringify(orderBody);
-  const path = '/api/v2/mix/order/place-order';
-  const response = await axios.post(`https://api.bitget.com${path}`, body, {
-    headers: bitgetHeaders(timestamp, path, body)
+    orderType: 'market',
+    presetStopLossPrice: stopLoss.toString()
   });
-  return response.data;
+
+  const mainPath = '/api/v2/mix/order/place-order';
+  const mainTimestamp = Date.now().toString();
+  const mainOrder = await axios.post(`https://api.bitget.com${mainPath}`, mainBody, {
+    headers: bitgetHeaders(mainTimestamp, mainPath, mainBody)
+  });
+
+  console.log(`✅ Haupt-Order platziert`);
+
+  // TP Orders platzieren
+  if (targets && targets.length > 0) {
+    const distribution = getTPDistribution(targets.length);
+    const closeSide = direction === 'Long' ? 'sell' : 'buy';
+
+    for (let i = 0; i < targets.length; i++) {
+      const tp = targets[i];
+      const percent = distribution[i] / 100;
+      const tpSize = (totalSize * percent).toFixed(4);
+
+      await new Promise(r => setTimeout(r, 500)); // kurze Pause
+
+      const tpTimestamp = Date.now().toString();
+      const tpBody = JSON.stringify({
+        symbol: fullSymbol,
+        productType: 'USDT-FUTURES',
+        marginCoin: 'USDT',
+        size: tpSize,
+        side: closeSide,
+        tradeSide: 'close',
+        orderType: 'limit',
+        price: tp.price.toString()
+      });
+
+      const tpPath = '/api/v2/mix/order/place-order';
+      await axios.post(`https://api.bitget.com${tpPath}`, tpBody, {
+        headers: bitgetHeaders(tpTimestamp, tpPath, tpBody)
+      });
+
+      console.log(`🎯 TP${i + 1} Order: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%)`);
+    }
+  }
+
+  return mainOrder.data;
 }
 
 async function closePosition(symbol) {
@@ -100,6 +149,31 @@ async function closePosition(symbol) {
   return response.data;
 }
 
+async function moveSlToBreakeven(symbol, direction, entryPrice) {
+  const timestamp = Date.now().toString();
+  const path = '/api/v2/mix/position/modify-margin-amount';
+
+  // SL auf Entry setzen via Position SL Update
+  const slPath = '/api/v2/mix/order/place-tpsl';
+  const slTimestamp = Date.now().toString();
+  const slBody = JSON.stringify({
+    symbol: symbol + 'USDT',
+    productType: 'USDT-FUTURES',
+    marginCoin: 'USDT',
+    planType: 'loss_plan',
+    triggerPrice: entryPrice.toString(),
+    triggerType: 'mark_price',
+    holdSide: direction === 'Long' ? 'long' : 'short'
+  });
+
+  const response = await axios.post(`https://api.bitget.com${slPath}`, slBody, {
+    headers: bitgetHeaders(slTimestamp, slPath, slBody)
+  });
+  return response.data;
+}
+
+// ─── Claude Signal Analyse ─────────────────────────────────
+
 async function analyzeSignal(text, imageUrl) {
   const content = [];
 
@@ -111,13 +185,13 @@ async function analyzeSignal(text, imageUrl) {
 
   content.push({
     type: 'text',
-    text: `Du bist ein Trading Signal Analyzer. Analysiere diese Nachricht.
+    text: `Du bist ein Trading Signal Analyzer. Analysiere diese Nachricht/Bild genau.
 
 Nachricht: "${text}"
 
-Antworte NUR in diesem JSON Format ohne Markdown:
+Antworte NUR in JSON ohne Markdown.
 
-Für ein neues Signal:
+Für ein neues Trade Signal:
 {
   "signal": true,
   "action": "open",
@@ -125,25 +199,33 @@ Für ein neues Signal:
   "direction": "Long",
   "entry": 67000,
   "stopLoss": 65000,
-  "takeProfit": 70000,
+  "targets": [
+    { "price": 68000 },
+    { "price": 69500 },
+    { "price": 71000 }
+  ],
   "confidence": "Hoch"
 }
 
-Für ein Close Signal (z.B. "close BTC", "exit", "close all", "raus"):
-{
-  "signal": true,
-  "action": "close",
-  "asset": "BTC"
-}
+Für Close Signal ("close", "exit", "raus", "close BTC"):
+{ "signal": true, "action": "close", "asset": "BTC" }
 
-Falls kein Trading Signal: { "signal": false }
-Confidence ist Hoch nur wenn ein Stop Loss klar erkennbar ist.
-entry, stopLoss, takeProfit sind Zahlen oder null.`
+Für Breakeven Signal ("BE", "move SL to BE", "breakeven"):
+{ "signal": true, "action": "breakeven", "asset": "BTC", "entry": 67000 }
+
+Falls kein Signal: { "signal": false }
+
+Regeln:
+- Extrahiere ALLE TPs die erkennbar sind (auch aus Bildern)
+- targets ist ein Array mit allen TP Preisen als Zahlen
+- entry, stopLoss sind Zahlen oder null
+- Confidence ist Hoch nur wenn SL erkennbar ist
+- Bei BE Signal: entry Preis aus dem Kontext nehmen falls bekannt`
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 200,
+    max_tokens: 400,
     messages: [{ role: 'user', content }]
   }, {
     headers: {
@@ -156,6 +238,8 @@ entry, stopLoss, takeProfit sind Zahlen oder null.`
   const raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
   return JSON.parse(raw);
 }
+
+// ─── Discord Bot ───────────────────────────────────────────
 
 client.on('ready', () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
@@ -178,7 +262,7 @@ client.on('messageCreate', async (message) => {
     console.log(`📊 Signal:`, JSON.stringify(signal));
 
     if (!signal.signal) {
-      console.log(`⏭️ Keine Trading Aktion – übersprungen`);
+      console.log(`⏭️ Kein Signal – übersprungen`);
       return;
     }
 
@@ -190,6 +274,18 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // BREAKEVEN
+    if (signal.action === 'breakeven') {
+      if (!signal.entry) {
+        console.log(`⏭️ Kein Entry Preis für BE – übersprungen`);
+        return;
+      }
+      console.log(`↔️ Setze SL auf BE: ${signal.asset} @ ${signal.entry}`);
+      const result = await moveSlToBreakeven(signal.asset, signal.direction || 'Long', signal.entry);
+      console.log(`✅ SL auf BE gesetzt:`, JSON.stringify(result));
+      return;
+    }
+
     // OPEN
     if (signal.confidence === 'Niedrig') {
       console.log(`⏭️ Confidence zu niedrig – übersprungen`);
@@ -197,16 +293,18 @@ client.on('messageCreate', async (message) => {
     }
 
     if (!signal.stopLoss) {
-      console.log(`⏭️ Kein SL angegeben – Trade übersprungen`);
+      console.log(`⏭️ Kein SL – Trade übersprungen`);
       return;
     }
 
     await setLeverage(signal.asset);
-    console.log(`⚙️ Leverage: ${LEVERAGE}x gesetzt`);
+    console.log(`⚙️ Leverage: ${LEVERAGE}x`);
 
-    console.log(`🟢 ${signal.asset} ${signal.direction} | Risk: $${RISK_USD}`);
-    const order = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.takeProfit);
-    console.log(`✅ Trade erfolgreich:`, JSON.stringify(order));
+    const tpCount = signal.targets?.length || 0;
+    console.log(`🟢 ${signal.asset} ${signal.direction} | ${tpCount} TPs | Risk: $${RISK_USD}`);
+
+    const order = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.targets);
+    console.log(`✅ Alle Orders platziert`);
 
   } catch (err) {
     console.error(`❌ Fehler:`, err.response?.data || err.message);
