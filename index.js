@@ -9,12 +9,25 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const BITGET_API_KEY = process.env.BITGET_API_KEY;
 const BITGET_SECRET = process.env.BITGET_SECRET;
 const BITGET_PASSPHRASE = process.env.BITGET_PASSPHRASE;
-const TRADE_SIZE_USD = 10;
+const RISK_USD = 1;
+const MAX_POSITION_USD = 100;
 const LEVERAGE = '1';
 
 function createSignature(timestamp, method, requestPath, body) {
   const message = timestamp + method + requestPath + (body || '');
   return crypto.createHmac('sha256', BITGET_SECRET).update(message).digest('base64');
+}
+
+function bitgetHeaders(timestamp, path, body) {
+  const sign = createSignature(timestamp, 'POST', path, body);
+  return {
+    'ACCESS-KEY': BITGET_API_KEY,
+    'ACCESS-SIGN': sign,
+    'ACCESS-TIMESTAMP': timestamp,
+    'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
+    'Content-Type': 'application/json',
+    'locale': 'en-US'
+  };
 }
 
 async function getPrice(symbol) {
@@ -24,38 +37,52 @@ async function getPrice(symbol) {
   return parseFloat(response.data.data[0].lastPr);
 }
 
-async function placeOrder(symbol, direction) {
+async function setLeverage(symbol) {
+  const timestamp = Date.now().toString();
+  const path = '/api/v2/mix/account/set-leverage';
+  const body = JSON.stringify({
+    symbol: symbol + 'USDT',
+    productType: 'USDT-FUTURES',
+    marginCoin: 'USDT',
+    leverage: LEVERAGE
+  });
+  await axios.post(`https://api.bitget.com${path}`, body, {
+    headers: bitgetHeaders(timestamp, path, body)
+  });
+}
+
+async function placeOrder(symbol, direction, stopLoss, takeProfit) {
   const timestamp = Date.now().toString();
   const fullSymbol = symbol + 'USDT';
   const price = await getPrice(symbol);
-  const size = (TRADE_SIZE_USD / price).toFixed(6);
 
-  const body = JSON.stringify({
+  const riskPerUnit = Math.abs(price - stopLoss);
+  let size = RISK_USD / riskPerUnit;
+  const notional = size * price;
+  if (notional > MAX_POSITION_USD) size = MAX_POSITION_USD / price;
+  size = size.toFixed(4);
+
+  console.log(`📐 Size: ${size} ${symbol} | Notional: $${(parseFloat(size) * price).toFixed(2)}`);
+
+  const orderBody = {
     symbol: fullSymbol,
     productType: 'USDT-FUTURES',
     marginMode: 'isolated',
     marginCoin: 'USDT',
-    size: size,
+    size,
     side: direction === 'Long' ? 'buy' : 'sell',
     tradeSide: 'open',
-    orderType: 'market',
-    leverage: LEVERAGE
-  });
+    orderType: 'market'
+  };
 
+  if (stopLoss) orderBody.presetStopLossPrice = stopLoss.toString();
+  if (takeProfit) orderBody.presetStopSurplusPrice = takeProfit.toString();
+
+  const body = JSON.stringify(orderBody);
   const path = '/api/v2/mix/order/place-order';
-  const sign = createSignature(timestamp, 'POST', path, body);
-
   const response = await axios.post(`https://api.bitget.com${path}`, body, {
-    headers: {
-      'ACCESS-KEY': BITGET_API_KEY,
-      'ACCESS-SIGN': sign,
-      'ACCESS-TIMESTAMP': timestamp,
-      'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
-      'Content-Type': 'application/json',
-      'locale': 'en-US'
-    }
+    headers: bitgetHeaders(timestamp, path, body)
   });
-
   return response.data;
 }
 
@@ -79,11 +106,15 @@ Antworte NUR in diesem JSON Format ohne Markdown:
   "signal": true,
   "asset": "BTC",
   "direction": "Long",
+  "entry": 67000,
+  "stopLoss": 65000,
+  "takeProfit": 70000,
   "confidence": "Hoch"
 }
 
-Falls kein klares Trading Signal: { "signal": false }
-Confidence ist Hoch wenn Entry + SL oder TP klar erkennbar sind, sonst Niedrig.`
+- entry, stopLoss, takeProfit sind Zahlen oder null
+- Falls kein klares Trading Signal: { "signal": false }
+- Confidence ist Hoch nur wenn ein Stop Loss klar erkennbar ist`
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
@@ -127,8 +158,16 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    console.log(`🚀 Öffne Trade: ${signal.asset} ${signal.direction} mit $${TRADE_SIZE_USD}`);
-    const order = await placeOrder(signal.asset, signal.direction);
+    if (!signal.stopLoss) {
+      console.log(`⏭️ Kein SL angegeben – Trade übersprungen`);
+      return;
+    }
+
+    await setLeverage(signal.asset);
+    console.log(`⚙️ Leverage: ${LEVERAGE}x gesetzt`);
+
+    console.log(`🚀 ${signal.asset} ${signal.direction} | Risk: $${RISK_USD}`);
+    const order = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.takeProfit);
     console.log(`✅ Trade erfolgreich:`, JSON.stringify(order));
 
   } catch (err) {
