@@ -86,6 +86,20 @@ async function placeOrder(symbol, direction, stopLoss, takeProfit) {
   return response.data;
 }
 
+async function closePosition(symbol) {
+  const timestamp = Date.now().toString();
+  const path = '/api/v2/mix/order/close-positions';
+  const body = JSON.stringify({
+    symbol: symbol + 'USDT',
+    productType: 'USDT-FUTURES',
+    marginCoin: 'USDT'
+  });
+  const response = await axios.post(`https://api.bitget.com${path}`, body, {
+    headers: bitgetHeaders(timestamp, path, body)
+  });
+  return response.data;
+}
+
 async function analyzeSignal(text, imageUrl) {
   const content = [];
 
@@ -97,13 +111,16 @@ async function analyzeSignal(text, imageUrl) {
 
   content.push({
     type: 'text',
-    text: `Du bist ein Trading Signal Analyzer. Analysiere diese Nachricht und extrahiere das Trading Signal.
+    text: `Du bist ein Trading Signal Analyzer. Analysiere diese Nachricht.
 
 Nachricht: "${text}"
 
 Antworte NUR in diesem JSON Format ohne Markdown:
+
+Für ein neues Signal:
 {
   "signal": true,
+  "action": "open",
   "asset": "BTC",
   "direction": "Long",
   "entry": 67000,
@@ -112,9 +129,16 @@ Antworte NUR in diesem JSON Format ohne Markdown:
   "confidence": "Hoch"
 }
 
-- entry, stopLoss, takeProfit sind Zahlen oder null
-- Falls kein klares Trading Signal: { "signal": false }
-- Confidence ist Hoch nur wenn ein Stop Loss klar erkennbar ist`
+Für ein Close Signal (z.B. "close BTC", "exit", "close all", "raus"):
+{
+  "signal": true,
+  "action": "close",
+  "asset": "BTC"
+}
+
+Falls kein Trading Signal: { "signal": false }
+Confidence ist Hoch nur wenn ein Stop Loss klar erkennbar ist.
+entry, stopLoss, takeProfit sind Zahlen oder null.`
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
@@ -153,8 +177,22 @@ client.on('messageCreate', async (message) => {
     const signal = await analyzeSignal(message.content, imageUrl);
     console.log(`📊 Signal:`, JSON.stringify(signal));
 
-    if (!signal.signal || signal.confidence === 'Niedrig') {
-      console.log(`⏭️ Kein valides Signal – übersprungen`);
+    if (!signal.signal) {
+      console.log(`⏭️ Keine Trading Aktion – übersprungen`);
+      return;
+    }
+
+    // CLOSE
+    if (signal.action === 'close') {
+      console.log(`🔴 Schließe Position: ${signal.asset}`);
+      const result = await closePosition(signal.asset);
+      console.log(`✅ Position geschlossen:`, JSON.stringify(result));
+      return;
+    }
+
+    // OPEN
+    if (signal.confidence === 'Niedrig') {
+      console.log(`⏭️ Confidence zu niedrig – übersprungen`);
       return;
     }
 
@@ -166,7 +204,7 @@ client.on('messageCreate', async (message) => {
     await setLeverage(signal.asset);
     console.log(`⚙️ Leverage: ${LEVERAGE}x gesetzt`);
 
-    console.log(`🚀 ${signal.asset} ${signal.direction} | Risk: $${RISK_USD}`);
+    console.log(`🟢 ${signal.asset} ${signal.direction} | Risk: $${RISK_USD}`);
     const order = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.takeProfit);
     console.log(`✅ Trade erfolgreich:`, JSON.stringify(order));
 
