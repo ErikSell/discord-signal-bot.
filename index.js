@@ -13,8 +13,6 @@ const RISK_USD = 1;
 const MAX_POSITION_USD = 100;
 const LEVERAGE = '1';
 
-// ─── Hilfsfunktionen ───────────────────────────────────────
-
 function createSignature(timestamp, method, requestPath, body) {
   const message = timestamp + method + requestPath + (body || '');
   return crypto.createHmac('sha256', BITGET_SECRET).update(message).digest('base64');
@@ -43,8 +41,6 @@ function getTPDistribution(count) {
   return distributions[count] || distributions[5];
 }
 
-// ─── Bitget API Calls ──────────────────────────────────────
-
 async function getPrice(symbol) {
   const response = await axios.get('https://api.bitget.com/api/v2/mix/market/ticker', {
     params: { symbol: symbol + 'USDT', productType: 'USDT-FUTURES' }
@@ -70,7 +66,6 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
   const fullSymbol = symbol + 'USDT';
   const price = await getPrice(symbol);
 
-  // Positionsgröße berechnen
   const riskPerUnit = Math.abs(price - stopLoss);
   let totalSize = RISK_USD / riskPerUnit;
   const notional = totalSize * price;
@@ -78,7 +73,6 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
 
   console.log(`📐 Total Size: ${totalSize.toFixed(4)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
 
-  // Haupt-Order platzieren
   const mainBody = JSON.stringify({
     symbol: fullSymbol,
     productType: 'USDT-FUTURES',
@@ -93,48 +87,45 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
 
   const mainPath = '/api/v2/mix/order/place-order';
   const mainTimestamp = Date.now().toString();
-  const mainOrder = await axios.post(`https://api.bitget.com${mainPath}`, mainBody, {
+  await axios.post(`https://api.bitget.com${mainPath}`, mainBody, {
     headers: bitgetHeaders(mainTimestamp, mainPath, mainBody)
   });
 
   console.log(`✅ Haupt-Order platziert`);
-  await new Promise(r => setTimeout(r, 3000));
+  await new Promise(r => setTimeout(r, 5000));
 
-
-  // TP Orders platzieren
   if (targets && targets.length > 0) {
     const distribution = getTPDistribution(targets.length);
-    const closeSide = direction === 'Long' ? 'sell' : 'buy';
+    const holdSide = direction === 'Long' ? 'long' : 'short';
 
     for (let i = 0; i < targets.length; i++) {
       const tp = targets[i];
       const percent = distribution[i] / 100;
       const tpSize = (totalSize * percent).toFixed(4);
 
-      await new Promise(r => setTimeout(r, 500)); // kurze Pause
+      await new Promise(r => setTimeout(r, 800));
 
       const tpTimestamp = Date.now().toString();
       const tpBody = JSON.stringify({
-  symbol: fullSymbol,
-  productType: 'USDT-FUTURES',
-  marginMode: 'isolated',
-  marginCoin: 'USDT',
-  size: tpSize,
-  side: closeSide,
-  tradeSide: 'close',
-  orderType: 'limit',
-  price: tp.price.toString()
-});
-      const tpPath = '/api/v2/mix/order/place-order';
+        symbol: fullSymbol,
+        productType: 'USDT-FUTURES',
+        marginCoin: 'USDT',
+        planType: 'profit_plan',
+        triggerPrice: tp.price.toString(),
+        triggerType: 'mark_price',
+        executePrice: tp.price.toString(),
+        size: tpSize,
+        holdSide: holdSide
+      });
+
+      const tpPath = '/api/v2/mix/order/place-tpsl';
       await axios.post(`https://api.bitget.com${tpPath}`, tpBody, {
         headers: bitgetHeaders(tpTimestamp, tpPath, tpBody)
       });
 
-      console.log(`🎯 TP${i + 1} Order: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%)`);
+      console.log(`🎯 TP${i + 1}: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%)`);
     }
   }
-
-  return mainOrder.data;
 }
 
 async function closePosition(symbol) {
@@ -152,12 +143,8 @@ async function closePosition(symbol) {
 }
 
 async function moveSlToBreakeven(symbol, direction, entryPrice) {
-  const timestamp = Date.now().toString();
-  const path = '/api/v2/mix/position/modify-margin-amount';
-
-  // SL auf Entry setzen via Position SL Update
-  const slPath = '/api/v2/mix/order/place-tpsl';
   const slTimestamp = Date.now().toString();
+  const slPath = '/api/v2/mix/order/place-tpsl';
   const slBody = JSON.stringify({
     symbol: symbol + 'USDT',
     productType: 'USDT-FUTURES',
@@ -167,14 +154,11 @@ async function moveSlToBreakeven(symbol, direction, entryPrice) {
     triggerType: 'mark_price',
     holdSide: direction === 'Long' ? 'long' : 'short'
   });
-
   const response = await axios.post(`https://api.bitget.com${slPath}`, slBody, {
     headers: bitgetHeaders(slTimestamp, slPath, slBody)
   });
   return response.data;
 }
-
-// ─── Claude Signal Analyse ─────────────────────────────────
 
 async function analyzeSignal(text, imageUrl) {
   const content = [];
@@ -222,7 +206,7 @@ Regeln:
 - targets ist ein Array mit allen TP Preisen als Zahlen
 - entry, stopLoss sind Zahlen oder null
 - Confidence ist Hoch nur wenn SL erkennbar ist
-- Bei BE Signal: entry Preis aus dem Kontext nehmen falls bekannt`
+- Bei BE Signal: entry Preis aus Kontext nehmen falls bekannt`
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
@@ -240,8 +224,6 @@ Regeln:
   const raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
   return JSON.parse(raw);
 }
-
-// ─── Discord Bot ───────────────────────────────────────────
 
 client.on('ready', () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
@@ -268,7 +250,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // CLOSE
     if (signal.action === 'close') {
       console.log(`🔴 Schließe Position: ${signal.asset}`);
       const result = await closePosition(signal.asset);
@@ -276,7 +257,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // BREAKEVEN
     if (signal.action === 'breakeven') {
       if (!signal.entry) {
         console.log(`⏭️ Kein Entry Preis für BE – übersprungen`);
@@ -288,7 +268,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // OPEN
     if (signal.confidence === 'Niedrig') {
       console.log(`⏭️ Confidence zu niedrig – übersprungen`);
       return;
@@ -305,7 +284,7 @@ client.on('messageCreate', async (message) => {
     const tpCount = signal.targets?.length || 0;
     console.log(`🟢 ${signal.asset} ${signal.direction} | ${tpCount} TPs | Risk: $${RISK_USD}`);
 
-    const order = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.targets);
+    await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.targets);
     console.log(`✅ Alle Orders platziert`);
 
   } catch (err) {
