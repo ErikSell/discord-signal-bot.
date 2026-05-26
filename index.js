@@ -48,6 +48,13 @@ async function getPrice(symbol) {
   return parseFloat(response.data.data[0].lastPr);
 }
 
+async function getSizePrecision(symbol) {
+  const response = await axios.get('https://api.bitget.com/api/v2/mix/market/contracts', {
+    params: { symbol: symbol + 'USDT', productType: 'USDT-FUTURES' }
+  });
+  return parseInt(response.data.data[0].volumePlace);
+}
+
 async function setLeverage(symbol) {
   const timestamp = Date.now().toString();
   const path = '/api/v2/mix/account/set-leverage';
@@ -65,20 +72,21 @@ async function setLeverage(symbol) {
 async function placeOrder(symbol, direction, stopLoss, targets) {
   const fullSymbol = symbol + 'USDT';
   const price = await getPrice(symbol);
+  const precision = await getSizePrecision(symbol);
 
   const riskPerUnit = Math.abs(price - stopLoss);
   let totalSize = RISK_USD / riskPerUnit;
   const notional = totalSize * price;
   if (notional > MAX_POSITION_USD) totalSize = MAX_POSITION_USD / price;
 
-  console.log(`📐 Total Size: ${totalSize.toFixed(4)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
+  console.log(`📐 Total Size: ${totalSize.toFixed(precision)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
 
   const mainBody = JSON.stringify({
     symbol: fullSymbol,
     productType: 'USDT-FUTURES',
     marginMode: 'isolated',
     marginCoin: 'USDT',
-    size: totalSize.toFixed(4),
+    size: totalSize.toFixed(precision),
     side: direction === 'Long' ? 'buy' : 'sell',
     tradeSide: 'open',
     orderType: 'market',
@@ -96,32 +104,30 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
 
   if (targets && targets.length > 0) {
     const distribution = getTPDistribution(targets.length);
-    const holdSide = direction === 'Long' ? 'long' : 'short';
 
     for (let i = 0; i < targets.length; i++) {
       const tp = targets[i];
       const percent = distribution[i] / 100;
-      const tpSize = (totalSize * percent).toFixed(4);
+      const tpSize = (totalSize * percent).toFixed(precision);
 
       await new Promise(r => setTimeout(r, 800));
 
       const tpTimestamp = Date.now().toString();
-const tpBody = JSON.stringify({
-  symbol: fullSymbol,
-  productType: 'USDT-FUTURES',
-  marginMode: 'isolated',
-  marginCoin: 'USDT',
-  side: direction === 'Long' ? 'sell' : 'buy',
-  tradeSide: 'close',
-  orderType: 'market',
-  size: tpSize,
-  triggerPrice: tp.price.toString(),
-  triggerType: 'mark_price',
-  planType: 'normal_plan'
-});
+      const tpBody = JSON.stringify({
+        symbol: fullSymbol,
+        productType: 'USDT-FUTURES',
+        marginMode: 'isolated',
+        marginCoin: 'USDT',
+        side: direction === 'Long' ? 'sell' : 'buy',
+        tradeSide: 'close',
+        orderType: 'market',
+        size: tpSize,
+        triggerPrice: tp.price.toString(),
+        triggerType: 'mark_price',
+        planType: 'normal_plan'
+      });
 
-
-const tpPath = '/api/v2/mix/order/place-plan-order';
+      const tpPath = '/api/v2/mix/order/place-plan-order';
       await axios.post(`https://api.bitget.com${tpPath}`, tpBody, {
         headers: bitgetHeaders(tpTimestamp, tpPath, tpBody)
       });
