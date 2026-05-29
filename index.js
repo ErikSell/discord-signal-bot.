@@ -15,17 +15,18 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 let RISK_USD = parseFloat(process.env.RISK_USD) || 40;
+let TEST_RISK_USD = parseFloat(process.env.RISK_USD) || 40;
 let MAX_POSITION_USD = parseFloat(process.env.MAX_POSITION_USD) || 5000;
 const LEVERAGE = '1';
 let botPaused = false;
 let waitingForRisk = false;
+let waitingForTestRisk = false;
 
 const tg = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 tg.on('polling_error', (error) => {
   console.error('TG Polling Error:', error.message);
   if (error.message.includes('401') || error.message.includes('Unauthorized')) {
-    console.error('❌ Telegram Token ungültig – polling gestoppt');
     tg.stopPolling();
   }
 });
@@ -257,8 +258,8 @@ Falls kein Signal: { "signal": false }
 Regeln:
 - Das Asset ist das ERSTE WORT vor Long/Short (z.B. "Hype Long" = asset: "HYPE")
 - Asset immer in GROSSBUCHSTABEN
-- Extrahiere ALLE TPs EXAKT wie angegeben – keine eigenen Zahlen erfinden
-- Bei Bildern: lies Preiszahlen absolut präzise ab, keine Schätzungen
+- Extrahiere ALLE TPs EXAKT wie angegeben – keine Zahlen erfinden
+- Bei Bildern: lies Preiszahlen absolut präzise ab
 - targets ist Array mit TP Preisen als Zahlen
 - entry, stopLoss sind Zahlen oder null
 - Confidence ist Hoch nur wenn SL erkennbar ist`
@@ -280,6 +281,41 @@ Regeln:
   return JSON.parse(raw);
 }
 
+function buildTestReport(signal, entryPrice) {
+  if (!signal.stopLoss) return '⚠️ Kein SL – keine Berechnung möglich';
+
+  const direction = signal.direction === 'Long' ? 1 : -1;
+  const riskPerUnit = Math.abs(entryPrice - signal.stopLoss);
+  const totalSize = TEST_RISK_USD / riskPerUnit;
+  const notional = totalSize * entryPrice;
+
+  let report = `\n💼 <b>Position Berechnung</b>\n`;
+  report += `Entry: $${entryPrice.toFixed(4)}\n`;
+  report += `Size: ${totalSize.toFixed(2)} ${signal.asset}\n`;
+  report += `Notional: $${notional.toFixed(2)}\n`;
+  report += `\n❌ <b>SL Hit ($${signal.stopLoss}):</b> -$${TEST_RISK_USD.toFixed(2)}\n`;
+
+  if (signal.targets && signal.targets.length > 0) {
+    const distribution = getTPDistribution(signal.targets.length);
+    let totalProfit = 0;
+    report += `\n🎯 <b>Take Profits:</b>\n`;
+
+    for (let i = 0; i < signal.targets.length; i++) {
+      const tp = signal.targets[i];
+      const percent = distribution[i] / 100;
+      const tpSize = totalSize * percent;
+      const profit = tpSize * (tp.price - entryPrice) * direction;
+      totalProfit += profit;
+      report += `TP${i + 1} ($${tp.price}) ${distribution[i]}%: +$${profit.toFixed(2)}\n`;
+    }
+
+    report += `\n💰 <b>Gesamt bei allen TPs: +$${totalProfit.toFixed(2)}</b>`;
+    report += `\n📊 RR: 1:${(totalProfit / TEST_RISK_USD).toFixed(2)}`;
+  }
+
+  return report;
+}
+
 // ─── Telegram Commands ─────────────────────────────────────
 
 tg.onText(/\/h/, (msg) => {
@@ -290,7 +326,8 @@ tg.onText(/\/h/, (msg) => {
 /positions — Offene Positionen mit Close Button
 /balance — Kontostand
 /pnl — Unrealisiertes PnL
-/risk — Risiko pro Trade ändern
+/risk — Live Risiko ändern
+/testrisk — Test Risiko ändern
 /close [ASSET] — Position schließen
 /pause — Bot pausieren
 /resume — Bot reaktivieren
@@ -304,7 +341,8 @@ tg.onText(/\/status/, (msg) => {
 🤖 <b>Bot Status</b>
 
 Status: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}
-Risiko: $${RISK_USD} pro Trade
+Live Risiko: $${RISK_USD} pro Trade
+Test Risiko: $${TEST_RISK_USD} pro Trade
 Max Position: $${MAX_POSITION_USD}
 Leverage: ${LEVERAGE}x
 Test Kanal: ${TEST_CHANNEL_ID ? '✅ Aktiv' : '❌ Nicht gesetzt'}
@@ -323,7 +361,14 @@ tg.onText(/\/resume/, (msg) => {
 
 tg.onText(/\/risk/, (msg) => {
   waitingForRisk = true;
-  tg.sendMessage(msg.chat.id, `💰 Aktuelles Risiko: <b>$${RISK_USD}</b>\n\nWie viel USDT soll ich pro Trade riskieren?\n(Einfach die Zahl eintippen)`, { parse_mode: 'HTML' });
+  waitingForTestRisk = false;
+  tg.sendMessage(msg.chat.id, `💰 Live Risiko: <b>$${RISK_USD}</b>\n\nNeues Live Risiko eintippen:`, { parse_mode: 'HTML' });
+});
+
+tg.onText(/\/testrisk/, (msg) => {
+  waitingForTestRisk = true;
+  waitingForRisk = false;
+  tg.sendMessage(msg.chat.id, `🧪 Test Risiko: <b>$${TEST_RISK_USD}</b>\n\nNeues Test Risiko eintippen:`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/balance/, async (msg) => {
@@ -403,7 +448,8 @@ tg.onText(/\/d/, async (msg) => {
     text += `💰 Balance: $${parseFloat(balance.accountEquity).toFixed(2)}\n`;
     text += `📈 PnL: ${totalPnl >= 0 ? '🟢' : '🔴'} $${totalPnl.toFixed(2)}\n`;
     text += `🎯 Positionen: ${positions.length}\n`;
-    text += `⚡ Risiko/Trade: $${RISK_USD}\n`;
+    text += `⚡ Live Risiko: $${RISK_USD}\n`;
+    text += `🧪 Test Risiko: $${TEST_RISK_USD}\n`;
     text += `📦 Max Position: $${MAX_POSITION_USD}\n`;
     text += `🤖 Bot: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}\n`;
     if (positions.length > 0) {
@@ -437,12 +483,18 @@ tg.on('callback_query', async (query) => {
 });
 
 tg.on('message', (msg) => {
-  if (waitingForRisk && msg.text && !msg.text.startsWith('/')) {
+  if ((waitingForRisk || waitingForTestRisk) && msg.text && !msg.text.startsWith('/')) {
     const amount = parseFloat(msg.text);
     if (!isNaN(amount) && amount > 0) {
-      RISK_USD = amount;
-      waitingForRisk = false;
-      tg.sendMessage(msg.chat.id, `✅ Risiko auf <b>$${RISK_USD}</b> gesetzt.`, { parse_mode: 'HTML' });
+      if (waitingForRisk) {
+        RISK_USD = amount;
+        waitingForRisk = false;
+        tg.sendMessage(msg.chat.id, `✅ Live Risiko auf <b>$${RISK_USD}</b> gesetzt.`, { parse_mode: 'HTML' });
+      } else {
+        TEST_RISK_USD = amount;
+        waitingForTestRisk = false;
+        tg.sendMessage(msg.chat.id, `✅ Test Risiko auf <b>$${TEST_RISK_USD}</b> gesetzt.`, { parse_mode: 'HTML' });
+      }
     } else {
       tg.sendMessage(msg.chat.id, '❌ Ungültige Zahl. Nochmal versuchen.');
     }
@@ -455,7 +507,7 @@ client.on('ready', async () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
   console.log(`📡 Live Kanal: ${CHANNEL_ID}`);
   console.log(`🧪 Test Kanal: ${TEST_CHANNEL_ID || 'nicht gesetzt'}`);
-  await notify(`✅ <b>Bot gestartet</b>\nRisiko: $${RISK_USD} | Max: $${MAX_POSITION_USD} | Leverage: ${LEVERAGE}x`);
+  await notify(`✅ <b>Bot gestartet</b>\nLive Risk: $${RISK_USD} | Test Risk: $${TEST_RISK_USD} | Max: $${MAX_POSITION_USD}`);
 });
 
 client.on('messageCreate', async (message) => {
@@ -474,24 +526,32 @@ client.on('messageCreate', async (message) => {
     const signal = await analyzeSignal(message.content, imageUrl);
     console.log(`📊 Signal:`, JSON.stringify(signal));
 
-    // TEST MODUS – nur Telegram Bericht, kein Trade
+    // TEST MODUS
     if (isTest) {
       if (!signal.signal) {
         await notify(`🧪 <b>Test – Kein Signal erkannt</b>`);
         return;
       }
-      const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
-      await notify(`
-🧪 <b>TEST MODUS – Kein Trade ausgeführt</b>
 
-Asset: ${signal.asset || '?'}
-Aktion: ${signal.action}
-Richtung: ${signal.direction || '?'}
-Entry: ${signal.entry ? '$' + signal.entry : 'Market'}
-SL: ${signal.stopLoss ? '$' + signal.stopLoss : '–'}
-${tpList}
-Confidence: ${signal.confidence || '?'}
-      `);
+      let entryPrice = signal.entry;
+      if (!entryPrice && signal.asset) {
+        try { entryPrice = await getPrice(signal.asset); } catch (e) {}
+      }
+
+      const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
+      let msg = `🧪 <b>TEST MODUS – Kein Trade ausgeführt</b>\n\n`;
+      msg += `Asset: ${signal.asset || '?'}\n`;
+      msg += `Richtung: ${signal.direction || '?'}\n`;
+      msg += `Entry: ${entryPrice ? '$' + entryPrice : 'Market'}\n`;
+      msg += `SL: ${signal.stopLoss ? '$' + signal.stopLoss : '–'}\n`;
+      msg += `${tpList}\n`;
+      msg += `Confidence: ${signal.confidence || '?'}`;
+
+      if (entryPrice && signal.stopLoss) {
+        msg += '\n' + buildTestReport(signal, entryPrice);
+      }
+
+      await notify(msg);
       return;
     }
 
