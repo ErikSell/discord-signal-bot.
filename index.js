@@ -14,7 +14,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 let RISK_USD = parseFloat(process.env.RISK_USD) || 40;
-const MAX_POSITION_USD = 500;
+let MAX_POSITION_USD = parseFloat(process.env.MAX_POSITION_USD) || 5000;
 const LEVERAGE = '1';
 let botPaused = false;
 let waitingForRisk = false;
@@ -136,7 +136,7 @@ async function placeOrder(symbol, direction, stopLoss, targets) {
   const notional = totalSize * price;
   if (notional > MAX_POSITION_USD) totalSize = MAX_POSITION_USD / price;
 
-  console.log(`📐 Size: ${totalSize.toFixed(precision)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
+  console.log(`📐 Size: ${totalSize.toFixed(precision)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)} | Risk: $${(totalSize * riskPerUnit).toFixed(2)}`);
 
   const mainBody = JSON.stringify({
     symbol: fullSymbol,
@@ -254,16 +254,17 @@ Für Breakeven Signal: { "signal": true, "action": "breakeven", "asset": "BTC", 
 Falls kein Signal: { "signal": false }
 
 Regeln:
-- Das Asset ist das ERSTE WORT vor Long/Short (z.B. "Hype Long" = asset: "HYPE", "BTC long" = asset: "BTC")
+- Das Asset ist das ERSTE WORT vor Long/Short (z.B. "Hype Long" = asset: "HYPE")
 - Asset immer in GROSSBUCHSTABEN
-- Extrahiere ALLE TPs (auch aus Bildern)
+- Extrahiere ALLE TPs (auch aus Bildern) EXAKT wie angegeben – keine eigenen Zahlen erfinden
+- Bei Bildern: lies Preiszahlen absolut präzise ab, keine Schätzungen
 - targets ist Array mit TP Preisen als Zahlen
 - entry, stopLoss sind Zahlen oder null
 - Confidence ist Hoch nur wenn SL erkennbar ist`
   });
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
-    model: 'claude-haiku-4-5-20251001',
+    model: 'claude-sonnet-4-6',
     max_tokens: 400,
     messages: [{ role: 'user', content }]
   }, {
@@ -301,6 +302,7 @@ tg.onText(/\/status/, (msg) => {
 
 Status: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}
 Risiko: $${RISK_USD} pro Trade
+Max Position: $${MAX_POSITION_USD}
 Leverage: ${LEVERAGE}x
   `, { parse_mode: 'HTML' });
 });
@@ -398,6 +400,7 @@ tg.onText(/\/d/, async (msg) => {
     text += `📈 PnL: ${totalPnl >= 0 ? '🟢' : '🔴'} $${totalPnl.toFixed(2)}\n`;
     text += `🎯 Positionen: ${positions.length}\n`;
     text += `⚡ Risiko/Trade: $${RISK_USD}\n`;
+    text += `📦 Max Position: $${MAX_POSITION_USD}\n`;
     text += `🤖 Bot: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}\n`;
     if (positions.length > 0) {
       text += '\n<b>Offene Positionen:</b>\n';
@@ -444,7 +447,7 @@ tg.on('message', (msg) => {
 
 client.on('ready', async () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
-  await notify(`✅ <b>Bot gestartet</b>\nRisiko: $${RISK_USD} | Leverage: ${LEVERAGE}x`);
+  await notify(`✅ <b>Bot gestartet</b>\nRisiko: $${RISK_USD} | Max: $${MAX_POSITION_USD} | Leverage: ${LEVERAGE}x`);
 });
 
 client.on('messageCreate', async (message) => {
