@@ -19,9 +19,14 @@ let RISK_USD = parseFloat(process.env.RISK_USD) || 40;
 let TEST_RISK_USD = parseFloat(process.env.RISK_USD) || 40;
 let MAX_POSITION_USD = parseFloat(process.env.MAX_POSITION_USD) || 5000;
 const LEVERAGE = '1';
+const BE_BUFFER = 0.001;
 let botPaused = false;
 let waitingForRisk = false;
 let waitingForTestRisk = false;
+let lastReportDate = null;
+
+// ─── Manual Trade State ────────────────────────────────────
+let manualTrade = null;
 
 // ─── Trade Storage ─────────────────────────────────────────
 const TRADES_FILE = './trades.json';
@@ -56,6 +61,7 @@ function addTrade(signal, entryPrice, totalSize) {
     closeTime: null,
     closeReason: null,
     pnl: 0,
+    beSet: false,
     events: []
   };
   trades.push(trade);
@@ -76,7 +82,7 @@ function getWinRate() {
   return { total: closed.length, wins, losses, rate: ((wins / closed.length) * 100).toFixed(1), totalPnl: totalPnl.toFixed(2) };
 }
 
-// ─── Telegram Setup ────────────────────────────────────────
+// ─── Telegram ──────────────────────────────────────────────
 const tg = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 tg.on('polling_error', (error) => {
@@ -89,6 +95,83 @@ async function notify(msg) {
   catch (e) { console.error('TG Error:', e.message); }
 }
 
+// ─── Daily Report ──────────────────────────────────────────
+async function sendDailyReport() {
+  try {
+    const now = new Date();
+    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+    const todayStr = now.toDateString();
+
+    const todayTrades = trades.filter(t => new Date(t.openTime).toDateString() === todayStr);
+    const runningTrades = trades.filter(t => t.status === 'open' && new Date(t.openTime).toDateString() !== todayStr);
+    const allOpen = trades.filter(t => t.status === 'open');
+
+    let positions = [];
+    try { positions = await getPositions(); } catch (e) {}
+
+    let report = `📊 <b>Daily Report – ${now.toLocaleDateString('de-DE')}</b>\n\n`;
+
+    // Geöffnete Trades heute
+    report += `📂 <b>Heute geöffnet (${todayTrades.length})</b>\n`;
+    if (todayTrades.length === 0) {
+      report += `Keine\n`;
+    } else {
+      for (const t of todayTrades) {
+        const pos = positions.find(p => p.symbol === t.asset + 'USDT');
+        const pnl = pos ? parseFloat(pos.unrealizedPL) : t.pnl;
+        const emoji = pnl >= 0 ? '🟢' : '🔴';
+        report += `${emoji} ${t.asset} ${t.direction} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+      }
+    }
+
+    report += `\n📌 <b>Laufende Trades (${runningTrades.length})</b>\n`;
+    if (runningTrades.length === 0) {
+      report += `Keine\n`;
+    } else {
+      for (const t of runningTrades) {
+        const pos = positions.find(p => p.symbol === t.asset + 'USDT');
+        const pnl = pos ? parseFloat(pos.unrealizedPL) : t.pnl;
+        const emoji = pnl >= 0 ? '🟢' : '🔴';
+        const openDays = Math.floor((now - new Date(t.openTime)) / (1000 * 60 * 60 * 24));
+        report += `${emoji} ${t.asset} ${t.direction} | ${openDays}d offen | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+      }
+    }
+
+    report += `\n📈 <b>Entwicklung (alle offenen, letzten 24h)</b>\n`;
+    if (allOpen.length === 0) {
+      report += `Keine offenen Positionen\n`;
+    } else {
+      let totalPnl = 0;
+      for (const t of allOpen) {
+        const pos = positions.find(p => p.symbol === t.asset + 'USDT');
+        if (pos) {
+          const pnl = parseFloat(pos.unrealizedPL);
+          totalPnl += pnl;
+          const emoji = pnl >= 0 ? '🟢' : '🔴';
+          report += `${emoji} ${t.asset}: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+        }
+      }
+      report += `\n💰 <b>Gesamt: ${totalPnl >= 0 ? '🟢 +' : '🔴 '}$${totalPnl.toFixed(2)}</b>`;
+    }
+
+    await notify(report);
+  } catch (e) {
+    console.error('Daily Report Fehler:', e.message);
+  }
+}
+
+function checkDailyReport() {
+  const now = new Date();
+  const utcHour = now.getUTCHours();
+  const utcMinute = now.getUTCMinutes();
+  const today = now.toDateString();
+  // 20:30 Deutschland (CEST = UTC+2) = 18:30 UTC
+  if (utcHour === 18 && utcMinute >= 30 && utcMinute < 31 && lastReportDate !== today) {
+    lastReportDate = today;
+    sendDailyReport();
+  }
+}
+
 // ─── Message Extraction ────────────────────────────────────
 function extractMessageContent(message) {
   let text = message.content || '';
@@ -96,9 +179,7 @@ function extractMessageContent(message) {
 
   if (message.attachments?.size > 0) {
     const att = message.attachments.first();
-    if (att.contentType?.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(att.url)) {
-      imageUrl = att.url;
-    }
+    if (att.contentType?.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(att.url)) imageUrl = att.url;
   }
 
   if (message.embeds?.length > 0) {
@@ -126,20 +207,12 @@ function createSignature(timestamp, method, requestPath, body) {
 
 function bitgetHeaders(timestamp, path, body) {
   const sign = createSignature(timestamp, 'POST', path, body);
-  return {
-    'ACCESS-KEY': BITGET_API_KEY, 'ACCESS-SIGN': sign,
-    'ACCESS-TIMESTAMP': timestamp, 'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
-    'Content-Type': 'application/json', 'locale': 'en-US'
-  };
+  return { 'ACCESS-KEY': BITGET_API_KEY, 'ACCESS-SIGN': sign, 'ACCESS-TIMESTAMP': timestamp, 'ACCESS-PASSPHRASE': BITGET_PASSPHRASE, 'Content-Type': 'application/json', 'locale': 'en-US' };
 }
 
 function bitgetGetHeaders(timestamp, path, queryString = '') {
   const sign = createSignature(timestamp, 'GET', path + queryString, '');
-  return {
-    'ACCESS-KEY': BITGET_API_KEY, 'ACCESS-SIGN': sign,
-    'ACCESS-TIMESTAMP': timestamp, 'ACCESS-PASSPHRASE': BITGET_PASSPHRASE,
-    'Content-Type': 'application/json', 'locale': 'en-US'
-  };
+  return { 'ACCESS-KEY': BITGET_API_KEY, 'ACCESS-SIGN': sign, 'ACCESS-TIMESTAMP': timestamp, 'ACCESS-PASSPHRASE': BITGET_PASSPHRASE, 'Content-Type': 'application/json', 'locale': 'en-US' };
 }
 
 function getTPDistribution(count) {
@@ -148,16 +221,12 @@ function getTPDistribution(count) {
 }
 
 async function getPrice(symbol) {
-  const r = await axios.get('https://api.bitget.com/api/v2/mix/market/ticker', {
-    params: { symbol: symbol + 'USDT', productType: 'USDT-FUTURES' }
-  });
+  const r = await axios.get('https://api.bitget.com/api/v2/mix/market/ticker', { params: { symbol: symbol + 'USDT', productType: 'USDT-FUTURES' } });
   return parseFloat(r.data.data[0].lastPr);
 }
 
 async function getSizePrecision(symbol) {
-  const r = await axios.get('https://api.bitget.com/api/v2/mix/market/contracts', {
-    params: { symbol: symbol + 'USDT', productType: 'USDT-FUTURES' }
-  });
+  const r = await axios.get('https://api.bitget.com/api/v2/mix/market/contracts', { params: { symbol: symbol + 'USDT', productType: 'USDT-FUTURES' } });
   return parseInt(r.data.data[0].volumePlace);
 }
 
@@ -165,9 +234,7 @@ async function getBalance() {
   const timestamp = Date.now().toString();
   const path = '/api/v2/mix/account/accounts';
   const queryString = '?productType=USDT-FUTURES';
-  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, {
-    headers: bitgetGetHeaders(timestamp, path, queryString)
-  });
+  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, { headers: bitgetGetHeaders(timestamp, path, queryString) });
   return r.data.data.find(a => a.marginCoin === 'USDT');
 }
 
@@ -175,9 +242,7 @@ async function getPositions() {
   const timestamp = Date.now().toString();
   const path = '/api/v2/mix/position/all-position';
   const queryString = '?productType=USDT-FUTURES&marginCoin=USDT';
-  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, {
-    headers: bitgetGetHeaders(timestamp, path, queryString)
-  });
+  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, { headers: bitgetGetHeaders(timestamp, path, queryString) });
   return r.data.data.filter(p => parseFloat(p.total) > 0);
 }
 
@@ -188,13 +253,14 @@ async function setLeverage(symbol) {
   await axios.post(`https://api.bitget.com${path}`, body, { headers: bitgetHeaders(timestamp, path, body) });
 }
 
-async function placeOrder(symbol, direction, stopLoss, targets) {
+async function placeOrder(symbol, direction, stopLoss, targets, riskOverride) {
   const fullSymbol = symbol + 'USDT';
   const price = await getPrice(symbol);
   const precision = await getSizePrecision(symbol);
+  const riskAmount = riskOverride || RISK_USD;
 
   const riskPerUnit = Math.abs(price - stopLoss);
-  let totalSize = RISK_USD / riskPerUnit;
+  let totalSize = riskAmount / riskPerUnit;
   if (totalSize * price > MAX_POSITION_USD) totalSize = MAX_POSITION_USD / price;
 
   console.log(`📐 Size: ${totalSize.toFixed(precision)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
@@ -241,10 +307,14 @@ async function closePosition(symbol) {
 }
 
 async function moveSlToBreakeven(symbol, direction, entryPrice) {
+  const bePrice = direction === 'Long'
+    ? entryPrice * (1 + BE_BUFFER)
+    : entryPrice * (1 - BE_BUFFER);
+
   const slPath = '/api/v2/mix/order/place-tpsl';
   const slBody = JSON.stringify({
     symbol: symbol + 'USDT', productType: 'USDT-FUTURES', marginCoin: 'USDT',
-    planType: 'loss_plan', triggerPrice: entryPrice.toString(),
+    planType: 'loss_plan', triggerPrice: bePrice.toFixed(6).toString(),
     triggerType: 'mark_price', holdSide: direction === 'Long' ? 'long' : 'short'
   });
   const r = await axios.post(`https://api.bitget.com${slPath}`, slBody, { headers: bitgetHeaders(Date.now().toString(), slPath, slBody) });
@@ -256,10 +326,7 @@ async function takeTp1AndBreakeven(symbol, direction) {
   const timestamp = Date.now().toString();
   const path = '/api/v2/mix/order/orders-plan-pending';
   const queryString = `?symbol=${fullSymbol}&productType=USDT-FUTURES`;
-  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, {
-    headers: bitgetGetHeaders(timestamp, path, queryString)
-  });
-
+  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, { headers: bitgetGetHeaders(timestamp, path, queryString) });
   const planOrders = r.data.data?.entrustedList || r.data.data || [];
 
   if (planOrders.length === 0) {
@@ -315,7 +382,6 @@ async function monitorPositions() {
     const positions = await getPositions();
     const currentSymbols = new Set(positions.map(p => p.symbol));
 
-    // Positionen die nicht mehr da sind → geschlossen
     for (const symbol of Object.keys(lastPositionSizes)) {
       if (!currentSymbols.has(symbol)) {
         const asset = symbol.replace('USDT', '');
@@ -329,33 +395,18 @@ async function monitorPositions() {
           trade.status = 'closed';
           trade.closeTime = new Date().toISOString();
           trade.pnl = parseFloat(pnl.toFixed(2));
-
-          // Bestimme Close Reason
-          if (currentPrice <= trade.stopLoss && trade.direction === 'Long') {
-            trade.closeReason = 'SL';
-          } else if (currentPrice >= trade.stopLoss && trade.direction === 'Short') {
-            trade.closeReason = 'SL';
-          } else {
-            trade.closeReason = 'TP_FINAL';
-          }
-
+          trade.closeReason = currentPrice <= trade.stopLoss && trade.direction === 'Long' ? 'SL' : 'TP_FINAL';
           trade.events.push({ time: new Date().toISOString(), type: trade.closeReason, price: currentPrice, pnl: trade.pnl });
           saveTrades();
 
           const emoji = trade.pnl > 0 ? '🟢' : '🔴';
-          await notify(`
-${emoji} <b>Position geschlossen</b>
-Asset: ${asset}
-Grund: ${trade.closeReason}
-PnL: ${trade.pnl > 0 ? '+' : ''}$${trade.pnl}
-          `);
+          await notify(`${emoji} <b>Position geschlossen</b>\nAsset: ${asset}\nGrund: ${trade.closeReason}\nPnL: ${trade.pnl > 0 ? '+' : ''}$${trade.pnl}`);
         }
 
         delete lastPositionSizes[symbol];
       }
     }
 
-    // Größenänderungen erkennen → TP teilweise getriggert
     for (const position of positions) {
       const symbol = position.symbol;
       const asset = symbol.replace('USDT', '');
@@ -368,13 +419,15 @@ PnL: ${trade.pnl > 0 ? '+' : ''}$${trade.pnl}
         const sizeDecrease = lastSize - currentSize;
 
         if (trade) {
-          // Welches TP wurde getriggert?
           const distribution = getTPDistribution(trade.targets.length);
           let tpNumber = '?';
+          let isTP1 = false;
+
           for (let i = 0; i < trade.targets.length; i++) {
             const expectedSize = trade.totalSize * distribution[i] / 100;
             if (Math.abs(sizeDecrease - expectedSize) / expectedSize < 0.15) {
               tpNumber = i + 1;
+              if (i === 0) isTP1 = true;
               break;
             }
           }
@@ -383,21 +436,27 @@ PnL: ${trade.pnl > 0 ? '+' : ''}$${trade.pnl}
           const partialPnl = sizeDecrease * (currentPrice - trade.entry) * direction;
           trade.pnl += partialPnl;
           trade.events.push({ time: new Date().toISOString(), type: `TP${tpNumber}_HIT`, price: currentPrice, pnl: parseFloat(partialPnl.toFixed(2)) });
-          saveTrades();
 
-          await notify(`
-🎯 <b>TP${tpNumber} getriggert!</b>
-Asset: ${asset}
-Preis: $${currentPrice}
-Teilgewinn: +$${partialPnl.toFixed(2)}
-          `);
+          // AUTO-BE nach TP1
+          if (isTP1 && !trade.beSet) {
+            try {
+              await moveSlToBreakeven(asset, trade.direction, trade.entry);
+              trade.beSet = true;
+              trade.events.push({ time: new Date().toISOString(), type: 'AUTO_BE_SET', price: trade.entry });
+              await notify(`↔️ <b>Auto-BE gesetzt</b>\n${asset} SL auf $${(trade.direction === 'Long' ? trade.entry * (1 + BE_BUFFER) : trade.entry * (1 - BE_BUFFER)).toFixed(6)}`);
+            } catch (e) {
+              console.error('Auto-BE Fehler:', e.message);
+            }
+          }
+
+          saveTrades();
+          await notify(`🎯 <b>TP${tpNumber} getriggert!</b>\n${asset} @ $${currentPrice}\nTeilgewinn: +$${partialPnl.toFixed(2)}`);
         }
       }
 
       lastPositionSizes[symbol] = currentSize;
     }
 
-    // Neue Positionen initialisieren
     for (const position of positions) {
       if (!(position.symbol in lastPositionSizes)) {
         lastPositionSizes[position.symbol] = parseFloat(position.total);
@@ -442,7 +501,7 @@ Regeln:
 - Asset = ERSTES WORT vor Long/Short, immer GROSSBUCHSTABEN
 - Extrahiere ALLE TPs EXAKT – keine Zahlen erfinden
 - Bei Bildern: Preiszahlen absolut präzise ablesen
-- "TP1 hit", "TP2 hit", "third TP hit" etc. → signal: false (nur Info)
+- "TP1 hit", "TP2 hit" etc. → signal: false
 - "taking TP1 and moving stops BE" → action: take_tp1_be
 - Confidence ist Hoch nur wenn SL erkennbar ist`
   });
@@ -491,8 +550,10 @@ tg.onText(/\/h/, (msg) => {
 /history — Letzte 10 Trades
 /winrate — Winrate & Stats
 /trade [ASSET] — Trade Details
+/manual — Manuellen Trade öffnen
 /risk — Live Risiko ändern
 /testrisk — Test Risiko ändern
+/report — Daily Report jetzt
 /close [ASSET] — Position schließen
 /pause — Bot pausieren
 /resume — Bot reaktivieren
@@ -501,15 +562,22 @@ tg.onText(/\/h/, (msg) => {
   `, { parse_mode: 'HTML' });
 });
 
+tg.onText(/\/manual/, (msg) => {
+  manualTrade = { step: 'coin', data: {}, chatId: msg.chat.id };
+  tg.sendMessage(msg.chat.id, `📝 <b>Manueller Trade</b>\n\nWelchen Coin möchtest Du traden?\n(z.B. BTC, ETH, SOL)`, { parse_mode: 'HTML' });
+});
+
+tg.onText(/\/report/, async (msg) => {
+  await sendDailyReport();
+});
+
 tg.onText(/\/winrate/, (msg) => {
   const stats = getWinRate();
-  if (stats.total === 0) return tg.sendMessage(msg.chat.id, '📭 Noch keine geschlossenen Trades.');
+  if (stats.total === 0) return tg.sendMessage(msg.chat.id, '📭 Noch keine Trades.');
   tg.sendMessage(msg.chat.id, `
 📊 <b>Winrate & Stats</b>
 
-Trades gesamt: ${stats.total}
-Wins: 🟢 ${stats.wins}
-Losses: 🔴 ${stats.losses}
+Trades: ${stats.total} | Wins: 🟢 ${stats.wins} | Losses: 🔴 ${stats.losses}
 Winrate: <b>${stats.rate}%</b>
 Total PnL: ${parseFloat(stats.totalPnl) >= 0 ? '🟢' : '🔴'} $${stats.totalPnl}
   `, { parse_mode: 'HTML' });
@@ -517,7 +585,7 @@ Total PnL: ${parseFloat(stats.totalPnl) >= 0 ? '🟢' : '🔴'} $${stats.totalPn
 
 tg.onText(/\/history/, (msg) => {
   const closed = trades.filter(t => t.status === 'closed').slice(-10).reverse();
-  if (closed.length === 0) return tg.sendMessage(msg.chat.id, '📭 Keine Trade History.');
+  if (closed.length === 0) return tg.sendMessage(msg.chat.id, '📭 Keine History.');
   let text = '📋 <b>Letzte Trades</b>\n\n';
   for (const t of closed) {
     const emoji = t.pnl > 0 ? '🟢' : '🔴';
@@ -529,14 +597,12 @@ tg.onText(/\/history/, (msg) => {
 
 tg.onText(/\/trade (.+)/, (msg, match) => {
   const asset = match[1].toUpperCase();
-  const assetTrades = trades.filter(t => t.asset === asset).slice(-5).reverse();
+  const assetTrades = trades.filter(t => t.asset === asset).slice(-3).reverse();
   if (assetTrades.length === 0) return tg.sendMessage(msg.chat.id, `📭 Keine Trades für ${asset}.`);
-
   for (const t of assetTrades) {
     let text = `📊 <b>${t.asset} ${t.direction}</b>\n`;
     text += `Status: ${t.status === 'open' ? '🟡 Offen' : (t.pnl > 0 ? '🟢 Win' : '🔴 Loss')}\n`;
-    text += `Entry: $${t.entry}\n`;
-    text += `SL: $${t.stopLoss}\n`;
+    text += `Entry: $${t.entry} | SL: $${t.stopLoss}\n`;
     if (t.targets?.length > 0) text += `TPs: ${t.targets.map(tp => '$' + tp.price).join(' | ')}\n`;
     text += `Geöffnet: ${new Date(t.openTime).toLocaleString('de-DE')}\n`;
     if (t.closeTime) text += `Geschlossen: ${new Date(t.closeTime).toLocaleString('de-DE')}\n`;
@@ -544,8 +610,7 @@ tg.onText(/\/trade (.+)/, (msg, match) => {
     if (t.events?.length > 0) {
       text += `\n<b>Events:</b>\n`;
       for (const e of t.events) {
-        const time = new Date(e.time).toLocaleString('de-DE');
-        text += `• ${e.type} @ $${e.price} | ${e.pnl > 0 ? '+' : ''}$${e.pnl} | ${time}\n`;
+        text += `• ${e.type} @ $${e.price} | ${e.pnl >= 0 ? '+' : ''}$${e.pnl || 0} | ${new Date(e.time).toLocaleString('de-DE')}\n`;
       }
     }
     tg.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
@@ -558,8 +623,7 @@ tg.onText(/\/status/, (msg) => {
 🤖 <b>Bot Status</b>
 
 Status: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}
-Live Risiko: $${RISK_USD}
-Test Risiko: $${TEST_RISK_USD}
+Live Risiko: $${RISK_USD} | Test: $${TEST_RISK_USD}
 Max Position: $${MAX_POSITION_USD}
 Winrate: ${stats.total > 0 ? stats.rate + '%' : 'N/A'}
   `, { parse_mode: 'HTML' });
@@ -570,12 +634,12 @@ tg.onText(/\/resume/, (msg) => { botPaused = false; tg.sendMessage(msg.chat.id, 
 
 tg.onText(/\/risk/, (msg) => {
   waitingForRisk = true; waitingForTestRisk = false;
-  tg.sendMessage(msg.chat.id, `💰 Live Risiko: <b>$${RISK_USD}</b>\n\nNeues Live Risiko eintippen:`, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `💰 Live Risiko: <b>$${RISK_USD}</b>\n\nNeues eintippen:`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/testrisk/, (msg) => {
   waitingForTestRisk = true; waitingForRisk = false;
-  tg.sendMessage(msg.chat.id, `🧪 Test Risiko: <b>$${TEST_RISK_USD}</b>\n\nNeues Test Risiko eintippen:`, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `🧪 Test Risiko: <b>$${TEST_RISK_USD}</b>\n\nNeues eintippen:`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/balance/, async (msg) => {
@@ -606,14 +670,9 @@ tg.onText(/\/close (.+)/, async (msg, match) => {
   try {
     await closePosition(asset);
     const trade = getOpenTrade(asset);
-    if (trade) {
-      trade.status = 'closed';
-      trade.closeTime = new Date().toISOString();
-      trade.closeReason = 'MANUAL';
-      saveTrades();
-    }
+    if (trade) { trade.status = 'closed'; trade.closeTime = new Date().toISOString(); trade.closeReason = 'MANUAL'; saveTrades(); }
     tg.sendMessage(msg.chat.id, `✅ <b>${asset}</b> geschlossen.`, { parse_mode: 'HTML' });
-  } catch (e) { tg.sendMessage(msg.chat.id, `❌ Fehler: ${e.message}`); }
+  } catch (e) { tg.sendMessage(msg.chat.id, `❌ ${e.message}`); }
 });
 
 tg.onText(/\/positions/, async (msg) => {
@@ -627,10 +686,7 @@ tg.onText(/\/positions/, async (msg) => {
 ${p.holdSide === 'long' ? '🟢 Long' : '🔴 Short'} <b>${p.symbol}</b>
 Size: ${p.total} | Entry: $${parseFloat(p.openPriceAvg).toFixed(4)}
 PnL: ${pnl >= 0 ? '🟢' : '🔴'} $${pnl.toFixed(2)}
-      `, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: `❌ Close ${asset}`, callback_data: `close_${asset}` }]] }
-      });
+      `, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: `❌ Close ${asset}`, callback_data: `close_${asset}` }]] } });
     }
   } catch (e) { tg.sendMessage(msg.chat.id, '❌ Fehler.'); }
 });
@@ -643,10 +699,9 @@ tg.onText(/\/d/, async (msg) => {
     let text = `📊 <b>Dashboard</b>\n\n`;
     text += `💰 Balance: $${parseFloat(balance.accountEquity).toFixed(2)}\n`;
     text += `📈 PnL: ${totalPnl >= 0 ? '🟢' : '🔴'} $${totalPnl.toFixed(2)}\n`;
-    text += `🎯 Positionen: ${positions.length}\n`;
-    text += `📊 Winrate: ${stats.total > 0 ? stats.rate + '%' : 'N/A'}\n`;
-    text += `⚡ Live Risk: $${RISK_USD} | 🧪 Test: $${TEST_RISK_USD}\n`;
-    text += `🤖 Bot: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}\n`;
+    text += `🎯 Positionen: ${positions.length} | 📊 Winrate: ${stats.total > 0 ? stats.rate + '%' : 'N/A'}\n`;
+    text += `⚡ Live: $${RISK_USD} | 🧪 Test: $${TEST_RISK_USD}\n`;
+    text += `🤖 ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}\n`;
     if (positions.length > 0) {
       text += '\n<b>Positionen:</b>\n';
       for (const p of positions) {
@@ -655,12 +710,14 @@ tg.onText(/\/d/, async (msg) => {
       }
     }
     tg.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
-  } catch (e) { tg.sendMessage(msg.chat.id, '❌ Dashboard Fehler.'); }
+  } catch (e) { tg.sendMessage(msg.chat.id, '❌ Fehler.'); }
 });
 
 tg.on('callback_query', async (query) => {
-  if (query.data.startsWith('close_')) {
-    const asset = query.data.replace('close_', '');
+  const data = query.data;
+
+  if (data.startsWith('close_')) {
+    const asset = data.replace('close_', '');
     try {
       await closePosition(asset);
       const trade = getOpenTrade(asset);
@@ -669,10 +726,103 @@ tg.on('callback_query', async (query) => {
       tg.editMessageText(`✅ <b>${asset}</b> geschlossen.`, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'HTML' });
     } catch (e) { tg.answerCallbackQuery(query.id, { text: `❌ ${e.message}` }); }
   }
+
+  if (data === 'manual_long' || data === 'manual_short') {
+    if (manualTrade?.step === 'direction') {
+      manualTrade.data.direction = data === 'manual_long' ? 'Long' : 'Short';
+      manualTrade.step = 'sl';
+      tg.answerCallbackQuery(query.id);
+      tg.sendMessage(manualTrade.chatId, `✅ ${manualTrade.data.direction}\n\nStop Loss Preis eingeben:`, { parse_mode: 'HTML' });
+    }
+  }
+
+  if (data === 'manual_confirm') {
+    if (manualTrade?.step === 'confirm') {
+      tg.answerCallbackQuery(query.id, { text: 'Trade wird geöffnet...' });
+      const d = manualTrade.data;
+      manualTrade = null;
+      try {
+        await setLeverage(d.asset);
+        const result = await placeOrder(d.asset, d.direction, d.stopLoss, d.targets, d.risk);
+        addTrade({ asset: d.asset, direction: d.direction, stopLoss: d.stopLoss, targets: d.targets }, result.price, result.totalSize);
+        const tpList = d.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
+        await tg.sendMessage(TELEGRAM_CHAT_ID, `🟢 <b>Manueller Trade eröffnet</b>\n${d.asset} ${d.direction}\nEntry: $${result.price}\nSL: $${d.stopLoss}\n${tpList}\nRisk: $${d.risk}`, { parse_mode: 'HTML' });
+      } catch (e) {
+        await tg.sendMessage(TELEGRAM_CHAT_ID, `❌ Fehler: ${e.response?.data?.msg || e.message}`);
+      }
+    }
+  }
+
+  if (data === 'manual_cancel') {
+    manualTrade = null;
+    tg.answerCallbackQuery(query.id, { text: 'Abgebrochen' });
+    tg.sendMessage(query.message.chat.id, '❌ Trade abgebrochen.');
+  }
 });
 
-tg.on('message', (msg) => {
-  if ((waitingForRisk || waitingForTestRisk) && msg.text && !msg.text.startsWith('/')) {
+tg.on('message', async (msg) => {
+  if (!msg.text) return;
+
+  // Manual Trade Flow
+  if (manualTrade && !msg.text.startsWith('/')) {
+    const chatId = manualTrade.chatId;
+
+    if (manualTrade.step === 'coin') {
+      manualTrade.data.asset = msg.text.toUpperCase().trim();
+      manualTrade.step = 'direction';
+      tg.sendMessage(chatId, `Asset: <b>${manualTrade.data.asset}</b>\n\nRichtung?`, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🟢 Long', callback_data: 'manual_long' }, { text: '🔴 Short', callback_data: 'manual_short' }]] }
+      });
+      return;
+    }
+
+    if (manualTrade.step === 'sl') {
+      const sl = parseFloat(msg.text);
+      if (isNaN(sl)) { tg.sendMessage(chatId, '❌ Ungültige Zahl. Nochmal:'); return; }
+      manualTrade.data.stopLoss = sl;
+      manualTrade.step = 'tps';
+      tg.sendMessage(chatId, `SL: <b>$${sl}</b>\n\nTake Profits eingeben (kommagetrennt):\nz.B. <code>68000, 70000, 72000</code>`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    if (manualTrade.step === 'tps') {
+      const tpPrices = msg.text.split(',').map(t => parseFloat(t.trim())).filter(t => !isNaN(t));
+      if (tpPrices.length === 0) { tg.sendMessage(chatId, '❌ Ungültig. Kommagetrennt eingeben:'); return; }
+      manualTrade.data.targets = tpPrices.map(p => ({ price: p }));
+      manualTrade.step = 'risk';
+      tg.sendMessage(chatId, `TPs: <b>${tpPrices.map(p => '$' + p).join(', ')}</b>\n\nRisiko in $?`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    if (manualTrade.step === 'risk') {
+      const risk = parseFloat(msg.text);
+      if (isNaN(risk) || risk <= 0) { tg.sendMessage(chatId, '❌ Ungültig. Nochmal:'); return; }
+      manualTrade.data.risk = risk;
+      manualTrade.step = 'confirm';
+
+      const d = manualTrade.data;
+      const tpList = d.targets.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n');
+      tg.sendMessage(chatId, `
+📋 <b>Trade Zusammenfassung</b>
+
+Asset: ${d.asset}
+Richtung: ${d.direction}
+Stop Loss: $${d.stopLoss}
+${tpList}
+Risiko: $${d.risk}
+
+Bestätigen?
+      `, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '✅ Bestätigen', callback_data: 'manual_confirm' }, { text: '❌ Abbrechen', callback_data: 'manual_cancel' }]] }
+      });
+      return;
+    }
+  }
+
+  // Risk/TestRisk Input
+  if ((waitingForRisk || waitingForTestRisk) && !msg.text.startsWith('/')) {
     const amount = parseFloat(msg.text);
     if (!isNaN(amount) && amount > 0) {
       if (waitingForRisk) { RISK_USD = amount; waitingForRisk = false; tg.sendMessage(msg.chat.id, `✅ Live Risk: <b>$${RISK_USD}</b>`, { parse_mode: 'HTML' }); }
@@ -686,6 +836,7 @@ client.on('ready', async () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
   loadTrades();
   setInterval(monitorPositions, 60000);
+  setInterval(checkDailyReport, 60000);
   setTimeout(monitorPositions, 5000);
   await notify(`✅ <b>Bot gestartet</b>\nLive Risk: $${RISK_USD} | Max: $${MAX_POSITION_USD}`);
 });
@@ -706,7 +857,7 @@ client.on('messageCreate', async (message) => {
 
     if (isTest) {
       if (!signal.signal) { await notify(`🧪 <b>Kein Signal</b>\n${textContent?.substring(0, 100)}`); return; }
-      if (signal.action === 'take_tp1_be') { await notify(`🧪 <b>TEST – Take TP1 + BE</b>\nAsset: ${signal.asset}\nWürde TP1 schließen und SL auf BE setzen`); return; }
+      if (signal.action === 'take_tp1_be') { await notify(`🧪 <b>TEST – Take TP1 + BE</b>\nAsset: ${signal.asset}`); return; }
       let entryPrice = signal.entry;
       if (!entryPrice && signal.asset) try { entryPrice = await getPrice(signal.asset); } catch (e) {}
       const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
@@ -736,7 +887,7 @@ client.on('messageCreate', async (message) => {
     if (signal.action === 'take_tp1_be') {
       const result = await takeTp1AndBreakeven(signal.asset, signal.direction || 'Long');
       if (result.tp1AlreadyFilled) {
-        await notify(`↔️ <b>TP1 bereits getriggert – BE gesetzt</b>\n${signal.asset} @ $${result.entryPrice}`);
+        await notify(`↔️ <b>TP1 bereits getriggert – BE gesetzt</b>\n${signal.asset}`);
       } else {
         await notify(`✅ <b>TP1 geschlossen + BE gesetzt</b>\n${signal.asset} | ${result.tp1Size} Units`);
       }
@@ -745,18 +896,15 @@ client.on('messageCreate', async (message) => {
 
     if (signal.confidence === 'Niedrig' || !signal.stopLoss || !signal.asset) return;
 
-    // DUPLICATE PROTECTION
     const existingPosition = (await getPositions()).find(p => p.symbol === signal.asset + 'USDT');
     if (existingPosition) {
-      console.log(`⏭️ Duplicate Protection: ${signal.asset} bereits offen`);
+      console.log(`⏭️ Duplicate: ${signal.asset} bereits offen`);
       await notify(`⚠️ <b>Duplicate geblockt</b>\n${signal.asset} bereits offen`);
       return;
     }
 
     await setLeverage(signal.asset);
     const result = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.targets);
-
-    // Trade speichern
     addTrade(signal, result.price, result.totalSize);
 
     const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
