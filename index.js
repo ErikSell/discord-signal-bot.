@@ -39,6 +39,38 @@ async function notify(msg) {
   }
 }
 
+function extractMessageContent(message) {
+  let text = message.content || '';
+  let imageUrl = null;
+
+  // Normale Attachments
+  if (message.attachments && message.attachments.size > 0) {
+    const attachment = message.attachments.first();
+    if (attachment.contentType?.startsWith('image/') ||
+        /\.(jpg|jpeg|png|gif|webp)$/i.test(attachment.url)) {
+      imageUrl = attachment.url;
+    }
+  }
+
+  // Embeds – Text UND Bilder
+  if (message.embeds && message.embeds.length > 0) {
+    for (const embed of message.embeds) {
+      const parts = [];
+      if (embed.title) parts.push(embed.title);
+      if (embed.description) parts.push(embed.description);
+      if (embed.fields) embed.fields.forEach(f => parts.push(`${f.name}: ${f.value}`));
+      if (parts.length > 0) text += (text ? '\n' : '') + parts.join('\n');
+
+      if (!imageUrl) {
+        if (embed.image?.url) imageUrl = embed.image.url;
+        else if (embed.thumbnail?.url) imageUrl = embed.thumbnail.url;
+      }
+    }
+  }
+
+  return { text: text.trim(), imageUrl };
+}
+
 function createSignature(timestamp, method, requestPath, body) {
   const message = timestamp + method + requestPath + (body || '');
   return crypto.createHmac('sha256', BITGET_SECRET).update(message).digest('base64');
@@ -221,12 +253,102 @@ async function moveSlToBreakeven(symbol, direction, entryPrice) {
   return r.data;
 }
 
+async function takeTp1AndBreakeven(symbol, direction) {
+  const fullSymbol = symbol + 'USDT';
+
+  // Offene Plan-Orders holen
+  const timestamp = Date.now().toString();
+  const path = '/api/v2/mix/order/orders-plan-pending';
+  const queryString = `?symbol=${fullSymbol}&productType=USDT-FUTURES`;
+  const r = await axios.get(`https://api.bitget.com${path}${queryString}`, {
+    headers: bitgetGetHeaders(timestamp, path, queryString)
+  });
+
+  const planOrders = r.data.data?.entrustedList || r.data.data || [];
+  console.log(`📋 Offene Plan-Orders: ${planOrders.length}`);
+
+  if (planOrders.length === 0) {
+    console.log('Keine offenen Plan-Orders – TP1 bereits getriggert');
+    // Trotzdem BE setzen
+    const positions = await getPositions();
+    const position = positions.find(p => p.symbol === fullSymbol);
+    if (position) {
+      const entryPrice = parseFloat(position.openPriceAvg);
+      await moveSlToBreakeven(symbol, direction, entryPrice);
+      return { tp1AlreadyFilled: true, entryPrice };
+    }
+    return { tp1AlreadyFilled: true };
+  }
+
+  // TP1 finden – niedrigster Preis bei Long, höchster bei Short
+  const sorted = [...planOrders].sort((a, b) => {
+    const priceA = parseFloat(a.triggerPrice);
+    const priceB = parseFloat(b.triggerPrice);
+    return direction === 'Long' ? priceA - priceB : priceB - priceA;
+  });
+
+  const tp1Order = sorted[0];
+  const tp1Size = tp1Order.size;
+  const orderId = tp1Order.orderId;
+
+  console.log(`🎯 TP1 gefunden: ${tp1Size} @ $${tp1Order.triggerPrice} | ID: ${orderId}`);
+
+  // TP1 Plan-Order canceln
+  const cancelPath = '/api/v2/mix/order/cancel-plan-order';
+  const cancelBody = JSON.stringify({
+    symbol: fullSymbol,
+    productType: 'USDT-FUTURES',
+    marginCoin: 'USDT',
+    orderId: orderId
+  });
+  await axios.post(`https://api.bitget.com${cancelPath}`, cancelBody, {
+    headers: bitgetHeaders(Date.now().toString(), cancelPath, cancelBody)
+  });
+  console.log(`❌ TP1 Order gecancelt`);
+
+  // TP1 Größe at Market schließen
+  const precision = await getSizePrecision(symbol);
+  const closePath = '/api/v2/mix/order/place-order';
+  const closeBody = JSON.stringify({
+    symbol: fullSymbol,
+    productType: 'USDT-FUTURES',
+    marginMode: 'isolated',
+    marginCoin: 'USDT',
+    size: parseFloat(tp1Size).toFixed(precision),
+    side: direction === 'Long' ? 'sell' : 'buy',
+    tradeSide: 'close',
+    orderType: 'market'
+  });
+  await axios.post(`https://api.bitget.com${closePath}`, closeBody, {
+    headers: bitgetHeaders(Date.now().toString(), closePath, closeBody)
+  });
+  console.log(`✅ TP1 at Market geschlossen: ${tp1Size} ${symbol}`);
+
+  // Position holen für BE Entry Price
+  await new Promise(r => setTimeout(r, 2000));
+  const positions = await getPositions();
+  const position = positions.find(p => p.symbol === fullSymbol);
+
+  if (position) {
+    const entryPrice = parseFloat(position.openPriceAvg);
+    await moveSlToBreakeven(symbol, direction, entryPrice);
+    console.log(`↔️ SL auf BE gesetzt: $${entryPrice}`);
+    return { tp1Closed: true, tp1Size, entryPrice };
+  }
+
+  return { tp1Closed: true, tp1Size };
+}
+
 async function analyzeSignal(text, imageUrl) {
   const content = [];
   if (imageUrl) {
-    const imageResponse = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-    const base64 = Buffer.from(imageResponse.data).toString('base64');
-    content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } });
+    try {
+      const imageResponse = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+      const base64 = Buffer.from(imageResponse.data).toString('base64');
+      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: base64 } });
+    } catch (e) {
+      console.log('Bild konnte nicht geladen werden:', e.message);
+    }
   }
   content.push({
     type: 'text',
@@ -244,24 +366,23 @@ Für ein neues Trade Signal:
   "direction": "Long",
   "entry": 67000,
   "stopLoss": 65000,
-  "targets": [
-    { "price": 68000 },
-    { "price": 69500 }
-  ],
+  "targets": [{ "price": 68000 }, { "price": 69500 }],
   "confidence": "Hoch"
 }
 
 Für Close Signal: { "signal": true, "action": "close", "asset": "BTC" }
 Für Breakeven Signal: { "signal": true, "action": "breakeven", "asset": "BTC", "entry": 67000 }
+Für "Taking TP1 and moving stops to BE" / "taking TP1 now BE": { "signal": true, "action": "take_tp1_be", "asset": "BTC", "direction": "Long" }
 Falls kein Signal: { "signal": false }
 
 Regeln:
-- Das Asset ist das ERSTE WORT vor Long/Short (z.B. "Hype Long" = asset: "HYPE")
+- Das Asset ist das ERSTE WORT vor Long/Short
 - Asset immer in GROSSBUCHSTABEN
-- Extrahiere ALLE TPs EXAKT wie angegeben – keine Zahlen erfinden
+- Extrahiere ALLE TPs EXAKT wie angegeben
 - Bei Bildern: lies Preiszahlen absolut präzise ab
-- targets ist Array mit TP Preisen als Zahlen
-- entry, stopLoss sind Zahlen oder null
+- "TP1 hit", "TP2 hit", "third TP hit" etc. → signal: false (nur Info)
+- Nur explizite "close", "exit", "closing now" sind Close Signale
+- "taking TP1 and moving stops BE", "take TP1 move BE" → action: take_tp1_be
 - Confidence ist Hoch nur wenn SL erkennbar ist`
   });
 
@@ -283,23 +404,19 @@ Regeln:
 
 function buildTestReport(signal, entryPrice) {
   if (!signal.stopLoss) return '⚠️ Kein SL – keine Berechnung möglich';
-
   const direction = signal.direction === 'Long' ? 1 : -1;
   const riskPerUnit = Math.abs(entryPrice - signal.stopLoss);
   const totalSize = TEST_RISK_USD / riskPerUnit;
   const notional = totalSize * entryPrice;
-
   let report = `\n💼 <b>Position Berechnung</b>\n`;
   report += `Entry: $${entryPrice.toFixed(4)}\n`;
   report += `Size: ${totalSize.toFixed(2)} ${signal.asset}\n`;
   report += `Notional: $${notional.toFixed(2)}\n`;
   report += `\n❌ <b>SL Hit ($${signal.stopLoss}):</b> -$${TEST_RISK_USD.toFixed(2)}\n`;
-
   if (signal.targets && signal.targets.length > 0) {
     const distribution = getTPDistribution(signal.targets.length);
     let totalProfit = 0;
     report += `\n🎯 <b>Take Profits:</b>\n`;
-
     for (let i = 0; i < signal.targets.length; i++) {
       const tp = signal.targets[i];
       const percent = distribution[i] / 100;
@@ -308,11 +425,9 @@ function buildTestReport(signal, entryPrice) {
       totalProfit += profit;
       report += `TP${i + 1} ($${tp.price}) ${distribution[i]}%: +$${profit.toFixed(2)}\n`;
     }
-
-    report += `\n💰 <b>Gesamt bei allen TPs: +$${totalProfit.toFixed(2)}</b>`;
+    report += `\n💰 <b>Gesamt: +$${totalProfit.toFixed(2)}</b>`;
     report += `\n📊 RR: 1:${(totalProfit / TEST_RISK_USD).toFixed(2)}`;
   }
-
   return report;
 }
 
@@ -517,19 +632,27 @@ client.on('messageCreate', async (message) => {
   if (!isLive && !isTest) return;
   if (botPaused && isLive) { console.log('⏸ Pausiert'); return; }
 
-  console.log(`\n${isTest ? '🧪 TEST' : '📨 LIVE'} ${message.author.tag}: ${message.content}`);
+  const { text: textContent, imageUrl } = extractMessageContent(message);
 
-  const imageUrl = message.attachments.size > 0 ? message.attachments.first().url : null;
-  if (!message.content && !imageUrl) return;
+  console.log(`\n${isTest ? '🧪 TEST' : '📨 LIVE'} ${message.author.tag}: ${textContent || '[kein Text]'}`);
+  if (imageUrl) console.log(`🖼️ Bild: ${imageUrl.substring(0, 60)}...`);
+  if (message.embeds?.length > 0) console.log(`📋 Embeds: ${message.embeds.length}`);
+
+  if (!textContent && !imageUrl) return;
 
   try {
-    const signal = await analyzeSignal(message.content, imageUrl);
+    const signal = await analyzeSignal(textContent, imageUrl);
     console.log(`📊 Signal:`, JSON.stringify(signal));
 
     // TEST MODUS
     if (isTest) {
       if (!signal.signal) {
-        await notify(`🧪 <b>Test – Kein Signal erkannt</b>`);
+        await notify(`🧪 <b>Test – Kein Signal</b>\n${textContent?.substring(0, 100) || '-'}`);
+        return;
+      }
+
+      if (signal.action === 'take_tp1_be') {
+        await notify(`🧪 <b>TEST – Take TP1 + BE</b>\nAsset: ${signal.asset}\nWürde: TP1 Order suchen, canceln, at Market schließen, SL auf BE setzen`);
         return;
       }
 
@@ -539,8 +662,9 @@ client.on('messageCreate', async (message) => {
       }
 
       const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
-      let msg = `🧪 <b>TEST MODUS – Kein Trade ausgeführt</b>\n\n`;
+      let msg = `🧪 <b>TEST – Kein Trade ausgeführt</b>\n\n`;
       msg += `Asset: ${signal.asset || '?'}\n`;
+      msg += `Aktion: ${signal.action}\n`;
       msg += `Richtung: ${signal.direction || '?'}\n`;
       msg += `Entry: ${entryPrice ? '$' + entryPrice : 'Market'}\n`;
       msg += `SL: ${signal.stopLoss ? '$' + signal.stopLoss : '–'}\n`;
@@ -571,10 +695,21 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    if (signal.action === 'take_tp1_be') {
+      console.log(`🎯 Take TP1 + BE: ${signal.asset}`);
+      const result = await takeTp1AndBreakeven(signal.asset, signal.direction || 'Long');
+      if (result.tp1AlreadyFilled) {
+        await notify(`↔️ <b>TP1 bereits getriggert</b>\nSL auf BE gesetzt: ${signal.asset} @ $${result.entryPrice}`);
+      } else {
+        await notify(`✅ <b>TP1 geschlossen + BE gesetzt</b>\nAsset: ${signal.asset}\nGeschlossen: ${result.tp1Size} Units\nBE: $${result.entryPrice}`);
+      }
+      return;
+    }
+
     if (signal.confidence === 'Niedrig' || !signal.stopLoss) return;
 
     if (!signal.asset) {
-      console.log(`⏭️ Kein Asset erkannt – übersprungen`);
+      console.log(`⏭️ Kein Asset – übersprungen`);
       return;
     }
 
