@@ -4,6 +4,11 @@ const axios = require('axios');
 const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
+const express = require('express');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.use(express.json());
 
 const client = new Client();
 const CHANNEL_ID = process.env.CHANNEL_ID;
@@ -24,8 +29,6 @@ let botPaused = false;
 let waitingForRisk = false;
 let waitingForTestRisk = false;
 let lastReportDate = null;
-
-// ─── Manual Trade State ────────────────────────────────────
 let manualTrade = null;
 
 // ─── Trade Storage ─────────────────────────────────────────
@@ -82,6 +85,149 @@ function getWinRate() {
   return { total: closed.length, wins, losses, rate: ((wins / closed.length) * 100).toFixed(1), totalPnl: totalPnl.toFixed(2) };
 }
 
+// ─── Express API & Dashboard ───────────────────────────────
+app.get('/health', (req, res) => res.json({ status: 'ok', bot: 'running', paused: botPaused }));
+app.get('/api/trades', (req, res) => res.json(trades));
+app.get('/api/stats', (req, res) => res.json(getWinRate()));
+app.get('/api/positions', async (req, res) => {
+  try { res.json(await getPositions()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/balance', async (req, res) => {
+  try { res.json(await getBalance()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Bot Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif; background: #f5f5f7; color: #1d1d1f; }
+  .header { background: rgba(255,255,255,0.8); backdrop-filter: blur(20px); padding: 20px 40px; border-bottom: 1px solid #e5e5e7; position: sticky; top: 0; z-index: 100; }
+  .header h1 { font-size: 22px; font-weight: 600; }
+  .header p { color: #6e6e73; font-size: 13px; margin-top: 2px; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 32px 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 32px; }
+  .card { background: white; border-radius: 18px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+  .card .label { font-size: 13px; color: #6e6e73; margin-bottom: 8px; }
+  .card .value { font-size: 28px; font-weight: 600; }
+  .card .value.green { color: #30d158; }
+  .card .value.red { color: #ff3b30; }
+  .card .value.blue { color: #0071e3; }
+  .section { background: white; border-radius: 18px; padding: 28px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); margin-bottom: 20px; }
+  .section h2 { font-size: 17px; font-weight: 600; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; color: #6e6e73; font-weight: 500; padding: 0 12px 12px 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 12px; border-top: 1px solid #f5f5f7; font-size: 14px; }
+  tr:hover td { background: #f9f9fb; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
+  .badge.green { background: #e8f8ed; color: #30d158; }
+  .badge.red { background: #ffeeed; color: #ff3b30; }
+  .badge.yellow { background: #fff8e6; color: #ff9500; }
+  .refresh { background: #0071e3; color: white; border: none; padding: 10px 20px; border-radius: 980px; font-size: 14px; cursor: pointer; font-weight: 500; }
+  .refresh:hover { background: #0077ed; }
+  .empty { color: #6e6e73; font-size: 14px; text-align: center; padding: 30px; }
+  #lastUpdate { font-size: 12px; color: #6e6e73; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>📊 Trading Bot Dashboard</h1>
+  <p id="lastUpdate">Wird geladen...</p>
+</div>
+<div class="container">
+  <div class="grid" id="statsGrid"></div>
+  <div class="section">
+    <h2>🟡 Offene Positionen</h2>
+    <div id="openPositions"></div>
+  </div>
+  <div class="section">
+    <h2>📋 Trade History</h2>
+    <div id="tradeHistory"></div>
+  </div>
+  <button class="refresh" onclick="loadData()">🔄 Aktualisieren</button>
+</div>
+<script>
+async function loadData() {
+  try {
+    const [stats, positions, trades, balance] = await Promise.all([
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/positions').then(r => r.json()),
+      fetch('/api/trades').then(r => r.json()),
+      fetch('/api/balance').then(r => r.json())
+    ]);
+
+    document.getElementById('lastUpdate').textContent = 'Zuletzt aktualisiert: ' + new Date().toLocaleString('de-DE');
+
+    const totalPnl = positions.reduce((s, p) => s + parseFloat(p.unrealizedPL || 0), 0);
+    const pnlColor = totalPnl >= 0 ? 'green' : 'red';
+
+    document.getElementById('statsGrid').innerHTML = \`
+      <div class="card"><div class="label">Kontostand</div><div class="value blue">$\${parseFloat(balance.accountEquity || 0).toFixed(2)}</div></div>
+      <div class="card"><div class="label">Unrealisiert PnL</div><div class="value \${pnlColor}">\${totalPnl >= 0 ? '+' : ''}$\${totalPnl.toFixed(2)}</div></div>
+      <div class="card"><div class="label">Winrate</div><div class="value">\${stats.total > 0 ? stats.rate + '%' : 'N/A'}</div></div>
+      <div class="card"><div class="label">Trades</div><div class="value">\${stats.total}</div></div>
+      <div class="card"><div class="label">Wins / Losses</div><div class="value"><span style="color:#30d158">\${stats.wins}</span> / <span style="color:#ff3b30">\${stats.losses}</span></div></div>
+      <div class="card"><div class="label">Total PnL</div><div class="value \${parseFloat(stats.totalPnl) >= 0 ? 'green' : 'red'}">\${parseFloat(stats.totalPnl) >= 0 ? '+' : ''}$\${stats.totalPnl}</div></div>
+    \`;
+
+    const posHtml = positions.length === 0
+      ? '<div class="empty">Keine offenen Positionen</div>'
+      : \`<table><thead><tr><th>Asset</th><th>Richtung</th><th>Entry</th><th>Size</th><th>PnL</th></tr></thead><tbody>\${
+        positions.map(p => {
+          const pnl = parseFloat(p.unrealizedPL || 0);
+          return \`<tr>
+            <td><b>\${p.symbol}</b></td>
+            <td><span class="badge \${p.holdSide === 'long' ? 'green' : 'red'}">\${p.holdSide === 'long' ? 'Long' : 'Short'}</span></td>
+            <td>$\${parseFloat(p.openPriceAvg).toFixed(4)}</td>
+            <td>\${p.total}</td>
+            <td style="color:\${pnl >= 0 ? '#30d158' : '#ff3b30'}">\${pnl >= 0 ? '+' : ''}$\${pnl.toFixed(2)}</td>
+          </tr>\`;
+        }).join('')
+      }</tbody></table>\`;
+    document.getElementById('openPositions').innerHTML = posHtml;
+
+    const closed = trades.filter(t => t.status === 'closed').slice(-20).reverse();
+    const open = trades.filter(t => t.status === 'open');
+    const allTrades = [...open, ...closed];
+
+    const histHtml = allTrades.length === 0
+      ? '<div class="empty">Keine Trades</div>'
+      : \`<table><thead><tr><th>Asset</th><th>Richtung</th><th>Entry</th><th>SL</th><th>Status</th><th>PnL</th><th>Datum</th></tr></thead><tbody>\${
+        allTrades.map(t => {
+          const statusBadge = t.status === 'open'
+            ? '<span class="badge yellow">Offen</span>'
+            : t.pnl > 0 ? '<span class="badge green">Win</span>' : '<span class="badge red">Loss</span>';
+          return \`<tr>
+            <td><b>\${t.asset}</b></td>
+            <td><span class="badge \${t.direction === 'Long' ? 'green' : 'red'}">\${t.direction}</span></td>
+            <td>$\${t.entry}</td>
+            <td>$\${t.stopLoss}</td>
+            <td>\${statusBadge}</td>
+            <td style="color:\${t.pnl >= 0 ? '#30d158' : '#ff3b30'}">\${t.pnl >= 0 ? '+' : ''}$\${t.pnl}</td>
+            <td>\${new Date(t.openTime).toLocaleDateString('de-DE')}</td>
+          </tr>\`;
+        }).join('')
+      }</tbody></table>\`;
+    document.getElementById('tradeHistory').innerHTML = histHtml;
+
+  } catch (e) {
+    console.error('Fehler:', e);
+  }
+}
+
+loadData();
+setInterval(loadData, 30000);
+</script>
+</body>
+</html>`);
+});
+
+app.listen(PORT, () => console.log(`🌐 Web Server läuft auf Port ${PORT}`));
+
 // ─── Telegram ──────────────────────────────────────────────
 const tg = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
@@ -99,65 +245,53 @@ async function notify(msg) {
 async function sendDailyReport() {
   try {
     const now = new Date();
-    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
     const todayStr = now.toDateString();
-
     const todayTrades = trades.filter(t => new Date(t.openTime).toDateString() === todayStr);
     const runningTrades = trades.filter(t => t.status === 'open' && new Date(t.openTime).toDateString() !== todayStr);
     const allOpen = trades.filter(t => t.status === 'open');
-
     let positions = [];
     try { positions = await getPositions(); } catch (e) {}
 
     let report = `📊 <b>Daily Report – ${now.toLocaleDateString('de-DE')}</b>\n\n`;
 
-    // Geöffnete Trades heute
     report += `📂 <b>Heute geöffnet (${todayTrades.length})</b>\n`;
-    if (todayTrades.length === 0) {
-      report += `Keine\n`;
-    } else {
+    if (todayTrades.length === 0) { report += `Keine\n`; }
+    else {
       for (const t of todayTrades) {
         const pos = positions.find(p => p.symbol === t.asset + 'USDT');
         const pnl = pos ? parseFloat(pos.unrealizedPL) : t.pnl;
-        const emoji = pnl >= 0 ? '🟢' : '🔴';
-        report += `${emoji} ${t.asset} ${t.direction} | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+        report += `${pnl >= 0 ? '🟢' : '🔴'} ${t.asset} ${t.direction} | ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
       }
     }
 
     report += `\n📌 <b>Laufende Trades (${runningTrades.length})</b>\n`;
-    if (runningTrades.length === 0) {
-      report += `Keine\n`;
-    } else {
+    if (runningTrades.length === 0) { report += `Keine\n`; }
+    else {
       for (const t of runningTrades) {
         const pos = positions.find(p => p.symbol === t.asset + 'USDT');
         const pnl = pos ? parseFloat(pos.unrealizedPL) : t.pnl;
-        const emoji = pnl >= 0 ? '🟢' : '🔴';
-        const openDays = Math.floor((now - new Date(t.openTime)) / (1000 * 60 * 60 * 24));
-        report += `${emoji} ${t.asset} ${t.direction} | ${openDays}d offen | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+        const days = Math.floor((now - new Date(t.openTime)) / (1000 * 60 * 60 * 24));
+        report += `${pnl >= 0 ? '🟢' : '🔴'} ${t.asset} ${t.direction} | ${days}d | ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
       }
     }
 
-    report += `\n📈 <b>Entwicklung (alle offenen, letzten 24h)</b>\n`;
-    if (allOpen.length === 0) {
-      report += `Keine offenen Positionen\n`;
-    } else {
+    report += `\n📈 <b>Entwicklung (alle offenen)</b>\n`;
+    if (allOpen.length === 0) { report += `Keine offenen Positionen`; }
+    else {
       let totalPnl = 0;
       for (const t of allOpen) {
         const pos = positions.find(p => p.symbol === t.asset + 'USDT');
         if (pos) {
           const pnl = parseFloat(pos.unrealizedPL);
           totalPnl += pnl;
-          const emoji = pnl >= 0 ? '🟢' : '🔴';
-          report += `${emoji} ${t.asset}: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
+          report += `${pnl >= 0 ? '🟢' : '🔴'} ${t.asset}: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}\n`;
         }
       }
       report += `\n💰 <b>Gesamt: ${totalPnl >= 0 ? '🟢 +' : '🔴 '}$${totalPnl.toFixed(2)}</b>`;
     }
 
     await notify(report);
-  } catch (e) {
-    console.error('Daily Report Fehler:', e.message);
-  }
+  } catch (e) { console.error('Report Fehler:', e.message); }
 }
 
 function checkDailyReport() {
@@ -165,7 +299,6 @@ function checkDailyReport() {
   const utcHour = now.getUTCHours();
   const utcMinute = now.getUTCMinutes();
   const today = now.toDateString();
-  // 20:30 Deutschland (CEST = UTC+2) = 18:30 UTC
   if (utcHour === 18 && utcMinute >= 30 && utcMinute < 31 && lastReportDate !== today) {
     lastReportDate = today;
     sendDailyReport();
@@ -176,12 +309,10 @@ function checkDailyReport() {
 function extractMessageContent(message) {
   let text = message.content || '';
   let imageUrl = null;
-
   if (message.attachments?.size > 0) {
     const att = message.attachments.first();
     if (att.contentType?.startsWith('image/') || /\.(jpg|jpeg|png|gif|webp)$/i.test(att.url)) imageUrl = att.url;
   }
-
   if (message.embeds?.length > 0) {
     for (const embed of message.embeds) {
       const parts = [];
@@ -195,7 +326,6 @@ function extractMessageContent(message) {
       }
     }
   }
-
   return { text: text.trim(), imageUrl };
 }
 
@@ -258,12 +388,9 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskOverride) {
   const price = await getPrice(symbol);
   const precision = await getSizePrecision(symbol);
   const riskAmount = riskOverride || RISK_USD;
-
   const riskPerUnit = Math.abs(price - stopLoss);
   let totalSize = riskAmount / riskPerUnit;
   if (totalSize * price > MAX_POSITION_USD) totalSize = MAX_POSITION_USD / price;
-
-  console.log(`📐 Size: ${totalSize.toFixed(precision)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)}`);
 
   const mainBody = JSON.stringify({
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
@@ -307,10 +434,7 @@ async function closePosition(symbol) {
 }
 
 async function moveSlToBreakeven(symbol, direction, entryPrice) {
-  const bePrice = direction === 'Long'
-    ? entryPrice * (1 + BE_BUFFER)
-    : entryPrice * (1 - BE_BUFFER);
-
+  const bePrice = direction === 'Long' ? entryPrice * (1 + BE_BUFFER) : entryPrice * (1 - BE_BUFFER);
   const slPath = '/api/v2/mix/order/place-tpsl';
   const slBody = JSON.stringify({
     symbol: symbol + 'USDT', productType: 'USDT-FUTURES', marginCoin: 'USDT',
@@ -386,23 +510,18 @@ async function monitorPositions() {
       if (!currentSymbols.has(symbol)) {
         const asset = symbol.replace('USDT', '');
         const trade = getOpenTrade(asset);
-
         if (trade) {
           const currentPrice = await getPrice(asset).catch(() => 0);
           const direction = trade.direction === 'Long' ? 1 : -1;
           const pnl = trade.totalSize * (currentPrice - trade.entry) * direction;
-
           trade.status = 'closed';
           trade.closeTime = new Date().toISOString();
           trade.pnl = parseFloat(pnl.toFixed(2));
-          trade.closeReason = currentPrice <= trade.stopLoss && trade.direction === 'Long' ? 'SL' : 'TP_FINAL';
+          trade.closeReason = (currentPrice <= trade.stopLoss && trade.direction === 'Long') || (currentPrice >= trade.stopLoss && trade.direction === 'Short') ? 'SL' : 'TP_FINAL';
           trade.events.push({ time: new Date().toISOString(), type: trade.closeReason, price: currentPrice, pnl: trade.pnl });
           saveTrades();
-
-          const emoji = trade.pnl > 0 ? '🟢' : '🔴';
-          await notify(`${emoji} <b>Position geschlossen</b>\nAsset: ${asset}\nGrund: ${trade.closeReason}\nPnL: ${trade.pnl > 0 ? '+' : ''}$${trade.pnl}`);
+          await notify(`${trade.pnl > 0 ? '🟢' : '🔴'} <b>Position geschlossen</b>\nAsset: ${asset}\nGrund: ${trade.closeReason}\nPnL: ${trade.pnl > 0 ? '+' : ''}$${trade.pnl}`);
         }
-
         delete lastPositionSizes[symbol];
       }
     }
@@ -437,16 +556,13 @@ async function monitorPositions() {
           trade.pnl += partialPnl;
           trade.events.push({ time: new Date().toISOString(), type: `TP${tpNumber}_HIT`, price: currentPrice, pnl: parseFloat(partialPnl.toFixed(2)) });
 
-          // AUTO-BE nach TP1
           if (isTP1 && !trade.beSet) {
             try {
               await moveSlToBreakeven(asset, trade.direction, trade.entry);
               trade.beSet = true;
-              trade.events.push({ time: new Date().toISOString(), type: 'AUTO_BE_SET', price: trade.entry });
-              await notify(`↔️ <b>Auto-BE gesetzt</b>\n${asset} SL auf $${(trade.direction === 'Long' ? trade.entry * (1 + BE_BUFFER) : trade.entry * (1 - BE_BUFFER)).toFixed(6)}`);
-            } catch (e) {
-              console.error('Auto-BE Fehler:', e.message);
-            }
+              trade.events.push({ time: new Date().toISOString(), type: 'AUTO_BE_SET', price: trade.entry, pnl: 0 });
+              await notify(`↔️ <b>Auto-BE gesetzt</b>\n${asset} @ $${(trade.direction === 'Long' ? trade.entry * (1 + BE_BUFFER) : trade.entry * (1 - BE_BUFFER)).toFixed(6)}`);
+            } catch (e) { console.error('Auto-BE Fehler:', e.message); }
           }
 
           saveTrades();
@@ -462,9 +578,7 @@ async function monitorPositions() {
         lastPositionSizes[position.symbol] = parseFloat(position.total);
       }
     }
-  } catch (e) {
-    console.error('Monitor Fehler:', e.message);
-  }
+  } catch (e) { console.error('Monitor Fehler:', e.message); }
 }
 
 // ─── Claude Analysis ───────────────────────────────────────
@@ -564,23 +678,15 @@ tg.onText(/\/h/, (msg) => {
 
 tg.onText(/\/manual/, (msg) => {
   manualTrade = { step: 'coin', data: {}, chatId: msg.chat.id };
-  tg.sendMessage(msg.chat.id, `📝 <b>Manueller Trade</b>\n\nWelchen Coin möchtest Du traden?\n(z.B. BTC, ETH, SOL)`, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `📝 <b>Manueller Trade</b>\n\nWelchen Coin?`, { parse_mode: 'HTML' });
 });
 
-tg.onText(/\/report/, async (msg) => {
-  await sendDailyReport();
-});
+tg.onText(/\/report/, async (msg) => { await sendDailyReport(); });
 
 tg.onText(/\/winrate/, (msg) => {
   const stats = getWinRate();
   if (stats.total === 0) return tg.sendMessage(msg.chat.id, '📭 Noch keine Trades.');
-  tg.sendMessage(msg.chat.id, `
-📊 <b>Winrate & Stats</b>
-
-Trades: ${stats.total} | Wins: 🟢 ${stats.wins} | Losses: 🔴 ${stats.losses}
-Winrate: <b>${stats.rate}%</b>
-Total PnL: ${parseFloat(stats.totalPnl) >= 0 ? '🟢' : '🔴'} $${stats.totalPnl}
-  `, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `📊 <b>Winrate</b>\n\nTrades: ${stats.total} | 🟢 ${stats.wins} | 🔴 ${stats.losses}\nWinrate: <b>${stats.rate}%</b>\nTotal PnL: ${parseFloat(stats.totalPnl) >= 0 ? '🟢' : '🔴'} $${stats.totalPnl}`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/history/, (msg) => {
@@ -588,9 +694,7 @@ tg.onText(/\/history/, (msg) => {
   if (closed.length === 0) return tg.sendMessage(msg.chat.id, '📭 Keine History.');
   let text = '📋 <b>Letzte Trades</b>\n\n';
   for (const t of closed) {
-    const emoji = t.pnl > 0 ? '🟢' : '🔴';
-    const date = new Date(t.openTime).toLocaleDateString('de-DE');
-    text += `${emoji} <b>${t.asset}</b> ${t.direction} | ${t.closeReason} | ${t.pnl > 0 ? '+' : ''}$${t.pnl} | ${date}\n`;
+    text += `${t.pnl > 0 ? '🟢' : '🔴'} <b>${t.asset}</b> ${t.direction} | ${t.closeReason} | ${t.pnl > 0 ? '+' : ''}$${t.pnl} | ${new Date(t.openTime).toLocaleDateString('de-DE')}\n`;
   }
   tg.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
 });
@@ -619,14 +723,7 @@ tg.onText(/\/trade (.+)/, (msg, match) => {
 
 tg.onText(/\/status/, (msg) => {
   const stats = getWinRate();
-  tg.sendMessage(msg.chat.id, `
-🤖 <b>Bot Status</b>
-
-Status: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}
-Live Risiko: $${RISK_USD} | Test: $${TEST_RISK_USD}
-Max Position: $${MAX_POSITION_USD}
-Winrate: ${stats.total > 0 ? stats.rate + '%' : 'N/A'}
-  `, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `🤖 <b>Bot Status</b>\n\nStatus: ${botPaused ? '⏸ Pausiert' : '✅ Aktiv'}\nLive Risk: $${RISK_USD} | Test: $${TEST_RISK_USD}\nWinrate: ${stats.total > 0 ? stats.rate + '%' : 'N/A'}`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/pause/, (msg) => { botPaused = true; tg.sendMessage(msg.chat.id, '⏸ <b>Bot pausiert</b>', { parse_mode: 'HTML' }); });
@@ -634,12 +731,12 @@ tg.onText(/\/resume/, (msg) => { botPaused = false; tg.sendMessage(msg.chat.id, 
 
 tg.onText(/\/risk/, (msg) => {
   waitingForRisk = true; waitingForTestRisk = false;
-  tg.sendMessage(msg.chat.id, `💰 Live Risiko: <b>$${RISK_USD}</b>\n\nNeues eintippen:`, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `💰 Live Risk: <b>$${RISK_USD}</b>\n\nNeues eintippen:`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/testrisk/, (msg) => {
   waitingForTestRisk = true; waitingForRisk = false;
-  tg.sendMessage(msg.chat.id, `🧪 Test Risiko: <b>$${TEST_RISK_USD}</b>\n\nNeues eintippen:`, { parse_mode: 'HTML' });
+  tg.sendMessage(msg.chat.id, `🧪 Test Risk: <b>$${TEST_RISK_USD}</b>\n\nNeues eintippen:`, { parse_mode: 'HTML' });
 });
 
 tg.onText(/\/balance/, async (msg) => {
@@ -682,11 +779,10 @@ tg.onText(/\/positions/, async (msg) => {
     for (const p of positions) {
       const pnl = parseFloat(p.unrealizedPL);
       const asset = p.symbol.replace('USDT', '');
-      await tg.sendMessage(msg.chat.id, `
-${p.holdSide === 'long' ? '🟢 Long' : '🔴 Short'} <b>${p.symbol}</b>
-Size: ${p.total} | Entry: $${parseFloat(p.openPriceAvg).toFixed(4)}
-PnL: ${pnl >= 0 ? '🟢' : '🔴'} $${pnl.toFixed(2)}
-      `, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: `❌ Close ${asset}`, callback_data: `close_${asset}` }]] } });
+      await tg.sendMessage(msg.chat.id, `${p.holdSide === 'long' ? '🟢 Long' : '🔴 Short'} <b>${p.symbol}</b>\nSize: ${p.total} | Entry: $${parseFloat(p.openPriceAvg).toFixed(4)}\nPnL: ${pnl >= 0 ? '🟢' : '🔴'} $${pnl.toFixed(2)}`, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: `❌ Close ${asset}`, callback_data: `close_${asset}` }]] }
+      });
     }
   } catch (e) { tg.sendMessage(msg.chat.id, '❌ Fehler.'); }
 });
@@ -756,14 +852,13 @@ tg.on('callback_query', async (query) => {
   if (data === 'manual_cancel') {
     manualTrade = null;
     tg.answerCallbackQuery(query.id, { text: 'Abgebrochen' });
-    tg.sendMessage(query.message.chat.id, '❌ Trade abgebrochen.');
+    tg.sendMessage(query.message.chat.id, '❌ Abgebrochen.');
   }
 });
 
 tg.on('message', async (msg) => {
   if (!msg.text) return;
 
-  // Manual Trade Flow
   if (manualTrade && !msg.text.startsWith('/')) {
     const chatId = manualTrade.chatId;
 
@@ -779,16 +874,16 @@ tg.on('message', async (msg) => {
 
     if (manualTrade.step === 'sl') {
       const sl = parseFloat(msg.text);
-      if (isNaN(sl)) { tg.sendMessage(chatId, '❌ Ungültige Zahl. Nochmal:'); return; }
+      if (isNaN(sl)) { tg.sendMessage(chatId, '❌ Ungültig. Nochmal:'); return; }
       manualTrade.data.stopLoss = sl;
       manualTrade.step = 'tps';
-      tg.sendMessage(chatId, `SL: <b>$${sl}</b>\n\nTake Profits eingeben (kommagetrennt):\nz.B. <code>68000, 70000, 72000</code>`, { parse_mode: 'HTML' });
+      tg.sendMessage(chatId, `SL: <b>$${sl}</b>\n\nTake Profits (kommagetrennt):\nz.B. <code>68000, 70000, 72000</code>`, { parse_mode: 'HTML' });
       return;
     }
 
     if (manualTrade.step === 'tps') {
       const tpPrices = msg.text.split(',').map(t => parseFloat(t.trim())).filter(t => !isNaN(t));
-      if (tpPrices.length === 0) { tg.sendMessage(chatId, '❌ Ungültig. Kommagetrennt eingeben:'); return; }
+      if (tpPrices.length === 0) { tg.sendMessage(chatId, '❌ Ungültig. Nochmal:'); return; }
       manualTrade.data.targets = tpPrices.map(p => ({ price: p }));
       manualTrade.step = 'risk';
       tg.sendMessage(chatId, `TPs: <b>${tpPrices.map(p => '$' + p).join(', ')}</b>\n\nRisiko in $?`, { parse_mode: 'HTML' });
@@ -800,20 +895,9 @@ tg.on('message', async (msg) => {
       if (isNaN(risk) || risk <= 0) { tg.sendMessage(chatId, '❌ Ungültig. Nochmal:'); return; }
       manualTrade.data.risk = risk;
       manualTrade.step = 'confirm';
-
       const d = manualTrade.data;
       const tpList = d.targets.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n');
-      tg.sendMessage(chatId, `
-📋 <b>Trade Zusammenfassung</b>
-
-Asset: ${d.asset}
-Richtung: ${d.direction}
-Stop Loss: $${d.stopLoss}
-${tpList}
-Risiko: $${d.risk}
-
-Bestätigen?
-      `, {
+      tg.sendMessage(chatId, `📋 <b>Zusammenfassung</b>\n\nAsset: ${d.asset}\nRichtung: ${d.direction}\nSL: $${d.stopLoss}\n${tpList}\nRisiko: $${d.risk}\n\nBestätigen?`, {
         parse_mode: 'HTML',
         reply_markup: { inline_keyboard: [[{ text: '✅ Bestätigen', callback_data: 'manual_confirm' }, { text: '❌ Abbrechen', callback_data: 'manual_cancel' }]] }
       });
@@ -821,7 +905,6 @@ Bestätigen?
     }
   }
 
-  // Risk/TestRisk Input
   if ((waitingForRisk || waitingForTestRisk) && !msg.text.startsWith('/')) {
     const amount = parseFloat(msg.text);
     if (!isNaN(amount) && amount > 0) {
@@ -908,14 +991,7 @@ client.on('messageCreate', async (message) => {
     addTrade(signal, result.price, result.totalSize);
 
     const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
-    await notify(`
-🟢 <b>Trade eröffnet</b>
-Asset: ${signal.asset} ${signal.direction}
-Entry: $${result.price}
-SL: $${signal.stopLoss}
-${tpList}
-Risk: $${RISK_USD}
-    `);
+    await notify(`🟢 <b>Trade eröffnet</b>\nAsset: ${signal.asset} ${signal.direction}\nEntry: $${result.price}\nSL: $${signal.stopLoss}\n${tpList}\nRisk: $${RISK_USD}`);
 
   } catch (err) {
     const errMsg = err.response?.data?.msg || err.message;
