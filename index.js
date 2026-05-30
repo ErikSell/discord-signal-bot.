@@ -32,6 +32,7 @@ let waitingForTestRisk = false;
 let lastReportDate = null;
 let manualTrade = null;
 
+// ─── Trade Storage ─────────────────────────────────────────
 const TRADES_FILE = './trades.json';
 let trades = [];
 let lastPositionSizes = {};
@@ -85,6 +86,35 @@ function getWinRate() {
   return { total: closed.length, wins, losses, rate: ((wins / closed.length) * 100).toFixed(1), totalPnl: totalPnl.toFixed(2) };
 }
 
+// ─── Balance History ───────────────────────────────────────
+const BALANCE_FILE = './balance_history.json';
+let balanceHistory = [];
+
+function loadBalanceHistory() {
+  try {
+    if (fs.existsSync(BALANCE_FILE)) {
+      balanceHistory = JSON.parse(fs.readFileSync(BALANCE_FILE, 'utf8'));
+      console.log(`📈 ${balanceHistory.length} Balance Snapshots geladen`);
+    }
+  } catch (e) { balanceHistory = []; }
+}
+
+async function saveBalanceSnapshot() {
+  try {
+    const b = await getBalance();
+    if (!b) return;
+    const pos = await getPositions();
+    const upnl = pos.reduce((s, p) => s + parseFloat(p.unrealizedPL || 0), 0);
+    balanceHistory.push({
+      time: new Date().toISOString(),
+      equity: parseFloat(b.accountEquity || 0),
+      upnl: parseFloat(upnl.toFixed(2))
+    });
+    if (balanceHistory.length > 5000) balanceHistory = balanceHistory.slice(-5000);
+    fs.writeFileSync(BALANCE_FILE, JSON.stringify(balanceHistory));
+  } catch (e) { console.error('Balance snapshot Fehler:', e.message); }
+}
+
 // ─── Express ───────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'dashboard.html')));
 app.get('/health', (req, res) => res.json({ status: 'ok', bot: 'running', paused: botPaused }));
@@ -95,6 +125,12 @@ app.get('/api/positions', async (req, res) => {
 });
 app.get('/api/balance', async (req, res) => {
   try { res.json(await getBalance()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/equity', (req, res) => {
+  const days = parseInt(req.query.days) || 7;
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const filtered = balanceHistory.filter(b => new Date(b.time) >= cutoff);
+  res.json(filtered);
 });
 app.listen(PORT, () => console.log(`🌐 Web Server läuft auf Port ${PORT}`));
 
@@ -111,6 +147,7 @@ async function notify(msg) {
   catch (e) { console.error('TG Error:', e.message); }
 }
 
+// ─── Daily Report ──────────────────────────────────────────
 async function sendDailyReport() {
   try {
     const now = new Date();
@@ -150,6 +187,7 @@ function checkDailyReport() {
   }
 }
 
+// ─── Message Extraction ────────────────────────────────────
 function extractMessageContent(message) {
   let text = message.content || '';
   let imageUrl = null;
@@ -173,6 +211,7 @@ function extractMessageContent(message) {
   return { text: text.trim(), imageUrl };
 }
 
+// ─── Bitget Helpers ────────────────────────────────────────
 function createSignature(timestamp, method, requestPath, body) {
   const message = timestamp + method + requestPath + (body || '');
   return crypto.createHmac('sha256', BITGET_SECRET).update(message).digest('base64');
@@ -340,6 +379,7 @@ async function takeTp1AndBreakeven(symbol, direction) {
   return { tp1Closed: true, tp1Size };
 }
 
+// ─── Position Monitor ──────────────────────────────────────
 async function monitorPositions() {
   try {
     const positions = await getPositions();
@@ -407,7 +447,6 @@ async function monitorPositions() {
           await notify(`🎯 <b>TP${tpNumber} getriggert!</b>\n${asset} @ $${currentPrice}\nTeilgewinn: +$${partialPnl.toFixed(2)}`);
         }
       }
-
       lastPositionSizes[symbol] = currentSize;
     }
 
@@ -419,6 +458,7 @@ async function monitorPositions() {
   } catch (e) { console.error('Monitor Fehler:', e.message); }
 }
 
+// ─── Claude Analysis ───────────────────────────────────────
 async function analyzeSignal(text, imageUrl) {
   const content = [];
   if (imageUrl) {
@@ -489,6 +529,7 @@ function buildTestReport(signal, entryPrice) {
   return report;
 }
 
+// ─── Telegram Commands ─────────────────────────────────────
 tg.onText(/\/h/, (msg) => {
   tg.sendMessage(msg.chat.id, `
 📖 <b>Commands Übersicht</b>
@@ -750,12 +791,16 @@ tg.on('message', async (msg) => {
   }
 });
 
+// ─── Discord Bot ───────────────────────────────────────────
 client.on('ready', async () => {
   console.log(`✅ Bot läuft! Eingeloggt als ${client.user.tag}`);
   loadTrades();
+  loadBalanceHistory();
   setInterval(monitorPositions, 60000);
   setInterval(checkDailyReport, 60000);
+  setInterval(saveBalanceSnapshot, 30 * 60 * 1000);
   setTimeout(monitorPositions, 5000);
+  setTimeout(saveBalanceSnapshot, 5000);
   await notify(`✅ <b>Bot gestartet</b>\nLive Risk: $${RISK_USD} | Max: $${MAX_POSITION_USD}`);
 });
 
