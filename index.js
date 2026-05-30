@@ -33,7 +33,7 @@ let lastReportDate = null;
 let manualTrade = null;
 
 // ─── Trade Storage ─────────────────────────────────────────
-const TRADES_FILE = './trades.json';
+const TRADES_FILE = 'data/trades.json';
 let trades = [];
 let lastPositionSizes = {};
 
@@ -87,7 +87,7 @@ function getWinRate() {
 }
 
 // ─── Balance History ───────────────────────────────────────
-const BALANCE_FILE = './balance_history.json';
+const BALANCE_FILE = 'data/balance_history.json';
 let balanceHistory = [];
 
 function loadBalanceHistory() {
