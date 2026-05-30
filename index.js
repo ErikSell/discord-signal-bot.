@@ -798,7 +798,7 @@ client.on('ready', async () => {
   loadBalanceHistory();
   setInterval(monitorPositions, 60000);
   setInterval(checkDailyReport, 60000);
-  setInterval(saveBalanceSnapshot, 30 * 60 * 1000);
+  setInterval(saveBalanceSnapshot, 10 * 60 * 1000);
   setTimeout(monitorPositions, 5000);
   setTimeout(saveBalanceSnapshot, 5000);
   await notify(`✅ <b>Bot gestartet</b>\nLive Risk: $${RISK_USD} | Max: $${MAX_POSITION_USD}`);
