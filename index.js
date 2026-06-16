@@ -355,10 +355,10 @@ Fehlgeschlagener Call:
 - Aktuelle Position: ${positionContext}
 
 WICHTIG – Account ist im HEDGE MODE (Two-Way):
-- Take Profit / Stop Loss auf Position: /api/v2/mix/order/place-tpsl-order
+- TP/SL auf Position: /api/v2/mix/order/place-tpsl-order
   → planType: 'profit_plan' (TP) oder 'loss_plan' (SL), holdSide: 'long'/'short', triggerPrice, size, KEIN side/tradeSide
 - Market Order schließen (Teil): /api/v2/mix/order/place-order
-  → tradeSide: 'close', side bleibt gleich Eröffnungsseite (Long schließen=buy, Short schließen=sell)
+  → tradeSide: 'close', side = Eröffnungsseite (Long schließen=buy, Short schließen=sell)
 - Position komplett schließen: /api/v2/mix/order/close-positions
 - Plan Order canceln: /api/v2/mix/order/cancel-plan-order
 
@@ -368,14 +368,16 @@ Häufige Fixes:
 - "position not exist" → close-positions
 - "plan order already triggered" → direkt market close
 
-Antworte NUR in JSON:
+Antworte NUR mit reinem JSON, kein Text davor/danach:
 {"fixDescription":"1 Satz","path":"/api/v2/...","body":{...},"skip":false}
 Wenn nicht fixbar: {"skip":true,"fixDescription":"Grund"}`
       }]
     }, { headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
 
-    const raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
-    const fix = JSON.parse(raw);
+    let raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
+    const fb = raw.indexOf('{'), lb = raw.lastIndexOf('}');
+    if (fb === -1 || lb === -1) { console.error('❌ AI Retry: kein JSON'); return false; }
+    const fix = JSON.parse(raw.substring(fb, lb + 1));
     if (fix.skip) { console.log(`⏭️ AI Retry skip: ${fix.fixDescription}`); return false; }
     console.log(`🤖 AI Fix V${attempt}: ${fix.fixDescription}`);
     const fixBodyStr = JSON.stringify(fix.body);
@@ -405,7 +407,6 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskUSD) {
 
   const holdSide = direction === 'Long' ? 'long' : 'short';
 
-  // Haupt-Order (öffnen) – Hedge Mode: side=buy(Long)/sell(Short), tradeSide=open
   const mainBody = {
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
     marginCoin: 'USDT', size: totalSize.toFixed(precision),
@@ -440,7 +441,6 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskUSD) {
       const tpSize = (totalSize * distribution[i] / 100).toFixed(precision);
       await new Promise(r => setTimeout(r, 800));
 
-      // TP via positionsgebundenem TPSL Endpoint (wie SL/BE) – KEIN side/tradeSide nötig
       const tpBody = {
         symbol: fullSymbol, productType: 'USDT-FUTURES', marginCoin: 'USDT',
         planType: 'profit_plan',
@@ -527,7 +527,6 @@ async function takeTp1AndBreakeven(symbol, direction) {
   }
 
   const precision = await getSizePrecision(symbol);
-  // Hedge Mode: zum Schließen bleibt side = Eröffnungsseite, tradeSide = close
   const closeSide = direction === 'Long' ? 'buy' : 'sell';
 
   const closeBody = {
@@ -661,7 +660,7 @@ async function analyzeSignal(text, imageUrl) {
 
 Nachricht: "${text}"
 
-Antworte NUR in JSON ohne Markdown. Füge IMMER ein "reason" Feld hinzu (1 kurzer Satz).
+Antworte AUSSCHLIESSLICH mit reinem JSON. KEIN Text davor, KEINE Erklärung, KEIN "Analyzing", KEINE Markdown-Backticks. Beginne deine Antwort direkt mit { und beende sie mit }. Füge IMMER ein "reason" Feld hinzu (1 kurzer Satz).
 
 Neues Trade Signal:
 {"signal":true,"action":"open","asset":"BTC","direction":"Long","entry":67000,"stopLoss":65000,"targets":[{"price":68000},{"price":69500}],"confidence":"Hoch","reason":"..."}
@@ -699,8 +698,21 @@ STRIKTE REGELN:
     messages: [{ role: 'user', content }]
   }, { headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
 
-  const raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
-  return JSON.parse(raw);
+  // JSON robust rausschneiden, falls Claude Text davor/danach schreibt
+  let raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
+  const firstBrace = raw.indexOf('{');
+  const lastBrace = raw.lastIndexOf('}');
+  if (firstBrace === -1 || lastBrace === -1) {
+    console.error('❌ Kein JSON in Claude Antwort:', raw.substring(0, 200));
+    return { signal: false, reason: 'Antwort nicht parsebar' };
+  }
+  raw = raw.substring(firstBrace, lastBrace + 1);
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error('❌ JSON Parse Fehler:', raw.substring(0, 200));
+    return { signal: false, reason: 'JSON ungültig' };
+  }
 }
 
 // ─── Telegram Commands (nur Basics) ────────────────────────
