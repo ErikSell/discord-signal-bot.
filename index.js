@@ -304,7 +304,6 @@ async function getPositions() {
   return r.data.data.filter(p => parseFloat(p.total) > 0);
 }
 
-// Holt ALLE offenen Trigger-Orders (TP/SL via profit_loss UND normale plan orders)
 async function getAllPendingTrigger(fullSymbol) {
   const results = [];
   for (const pt of ['profit_loss', 'normal_plan']) {
@@ -319,7 +318,6 @@ async function getAllPendingTrigger(fullSymbol) {
   return results;
 }
 
-// Liefert nur die TP-Orders (Profit-Seite) sortiert: TP1 zuerst
 async function getTpOrders(fullSymbol, direction, entry) {
   const orders = await getAllPendingTrigger(fullSymbol);
   const tps = orders.filter(o => {
@@ -371,13 +369,18 @@ Fehlgeschlagener Call:
 - Direction: ${direction}
 - Aktuelle Position: ${positionContext}
 
-WICHTIG – HEDGE MODE (Two-Way):
-- TP/SL auf Position: /api/v2/mix/order/place-tpsl-order
-  → planType: 'profit_plan'(TP)/'loss_plan'(SL), holdSide:'long'/'short', triggerPrice, size, KEIN side/tradeSide
-- Teil-Position per Market schließen: /api/v2/mix/order/place-order
-  → tradeSide:'close', orderType:'market', size. Side: Long schließen=sell, Short schließen=buy
+WICHTIG – HEDGE MODE Regeln (side = Positions-Buch, NICHT die Aktion):
+- Long-Position öffnen: side='buy', tradeSide='open'
+- Long-Position schließen: side='buy', tradeSide='close'  (side bleibt buy!)
+- Short-Position öffnen: side='sell', tradeSide='open'
+- Short-Position schließen: side='sell', tradeSide='close'  (side bleibt sell!)
+- Fehler "No position to close" (22002) = falsche side! Long schließen MUSS side='buy' sein, Short schließen side='sell'.
+
+Endpoints:
+- TP/SL auf Position: /api/v2/mix/order/place-tpsl-order (planType:'profit_plan'/'loss_plan', holdSide, triggerPrice, size)
+- Teil-Position Market schließen: /api/v2/mix/order/place-order (tradeSide:'close', orderType:'market', size, side=Eröffnungsseite)
 - Komplett schließen: /api/v2/mix/order/close-positions
-- Plan/TPSL Order canceln: /api/v2/mix/order/cancel-plan-order (mit orderId + planType)
+- Plan/TPSL canceln: /api/v2/mix/order/cancel-plan-order (orderId + planType)
 
 Antworte NUR mit reinem JSON, kein Text davor/danach:
 {"fixDescription":"1 Satz","path":"/api/v2/...","body":{...},"skip":false}
@@ -512,7 +515,6 @@ async function takeTp1AndBreakeven(symbol, direction) {
   const tps = await getTpOrders(fullSymbol, direction, entry);
 
   if (tps.length === 0) {
-    // Keine TP-Order gefunden → nur BE setzen
     console.log('⏭️ Keine TP-Order gefunden, setze nur BE');
     await moveSlToBreakeven(symbol, direction, entry);
     return { tp1AlreadyFilled: true, entryPrice: entry };
@@ -536,23 +538,26 @@ async function takeTp1AndBreakeven(symbol, direction) {
     await aiRetry('cancel_tp1', cancelBody, cancelPath, direction, symbol, errMsg);
   }
 
-  // 2) TP1-Anteil per Market schließen (Hedge: Long schließen=sell, Short schließen=buy)
+  // 2) TP1-Anteil per Market schließen
+  // HEDGE MODE: side = Eröffnungsseite (Long schließen=buy, Short schließen=sell), tradeSide=close
   await new Promise(r => setTimeout(r, 800));
   const precision = await getSizePrecision(symbol);
-  const closeSide = direction === 'Long' ? 'sell' : 'buy';
+  const closeSide = direction === 'Long' ? 'buy' : 'sell';
   const closeBody = {
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
     marginCoin: 'USDT', size: parseFloat(tp1Size).toFixed(precision),
     side: closeSide, tradeSide: 'close', orderType: 'market'
   };
   const closePath = '/api/v2/mix/order/place-order';
+  let closeOk = false;
   try {
     await axios.post(`https://api.bitget.com${closePath}`, JSON.stringify(closeBody), { headers: bitgetHeaders(Date.now().toString(), closePath, JSON.stringify(closeBody)) });
     console.log(`✅ TP1-Anteil (${tp1Size}) per Market geschlossen`);
+    closeOk = true;
   } catch (e) {
     const errMsg = e.response?.data?.msg || e.message;
     console.error(`❌ TP1 Close Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
-    await aiRetry('take_tp1_close', closeBody, closePath, direction, symbol, errMsg);
+    closeOk = await aiRetry('take_tp1_close', closeBody, closePath, direction, symbol, errMsg);
   }
 
   // 3) BE setzen (auf Restposition)
@@ -561,7 +566,7 @@ async function takeTp1AndBreakeven(symbol, direction) {
     await moveSlToBreakeven(symbol, direction, entry);
   } catch (e) { console.error('BE nach TP1 Fehler:', e.message); }
 
-  return { tp1Closed: true, tp1Size, entryPrice: entry };
+  return { tp1Closed: closeOk, tp1Size, entryPrice: entry };
 }
 
 // ─── Position Monitor ──────────────────────────────────────
@@ -1086,8 +1091,10 @@ client.on('messageCreate', async (message) => {
         await notify(`${isTest ? '🧪 ' : ''}⚠️ <b>Keine offene Position</b>\n${signal.asset}`);
       } else if (result.tp1AlreadyFilled) {
         await notify(`${isTest ? '🧪 ' : ''}↔️ <b>Keine TP1-Order gefunden – nur BE gesetzt</b>\n${signal.asset}\n📋 ${signal.reason || ''}`);
-      } else {
+      } else if (result.tp1Closed) {
         await notify(`${isTest ? '🧪 ' : ''}✅ <b>TP1 geschlossen + BE gesetzt</b>\n${signal.asset} | ${result.tp1Size} Units\nTP2/TP3 laufen weiter\n📋 ${signal.reason || ''}`);
+      } else {
+        await notify(`${isTest ? '🧪 ' : ''}⚠️ <b>TP1 Close fehlgeschlagen – BE trotzdem gesetzt</b>\n${signal.asset}`);
       }
       return;
     }
