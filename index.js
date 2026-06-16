@@ -26,8 +26,8 @@ const DASHBOARD_USERNAME = process.env.DASHBOARD_USERNAME || 'Erik';
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || 'pumper2026';
 
 // ─── Risk als PROZENT vom Kontostand ───────────────────────
-let RISK_PERCENT = 1;        // Default 1%
-let TEST_RISK_PERCENT = 1;   // Default 1%
+let RISK_PERCENT = 1;
+let TEST_RISK_PERCENT = 1;
 let MAX_POSITION_USD = parseFloat(process.env.MAX_POSITION_USD) || 5000;
 const LEVERAGE = '1';
 let botPaused = false;
@@ -175,7 +175,6 @@ async function notify(msg) {
   catch (e) { console.error('TG Error:', e.message); }
 }
 
-// Berechnet die aktuelle Risk in Dollar aus dem %-Wert
 async function getRiskUSD(isTest = false) {
   const percent = isTest ? TEST_RISK_PERCENT : RISK_PERCENT;
   try {
@@ -247,7 +246,6 @@ function extractMessageContent(message) {
   return { text: text.trim(), imageUrl };
 }
 
-// FIX: Echten Bildtyp aus Magic Bytes erkennen
 function detectMediaType(buffer) {
   const arr = new Uint8Array(buffer).subarray(0, 4);
   let header = '';
@@ -345,7 +343,7 @@ async function aiRetry(action, failedBody, failedPath, direction, asset, errorMs
       max_tokens: 600,
       messages: [{
         role: 'user',
-        content: `Du bist ein Bitget Futures API Experte. Ein API-Call ist fehlgeschlagen. Analysiere und gib einen korrigierten Call zurück.
+        content: `Du bist ein Bitget Futures API Experte (HEDGE MODE Account). Ein API-Call ist fehlgeschlagen. Analysiere und gib einen korrigierten Call zurück.
 
 Fehlgeschlagener Call:
 - Action: ${action}
@@ -356,19 +354,19 @@ Fehlgeschlagener Call:
 - Direction: ${direction}
 - Aktuelle Position: ${positionContext}
 
-Bekannte korrekte Bitget V2 Endpoints:
-- Order: /api/v2/mix/order/place-order
-- Plan Order (TP): /api/v2/mix/order/place-plan-order
-- SL/TP auf Position: /api/v2/mix/order/place-tpsl-order (braucht size!)
-- Position schließen: /api/v2/mix/order/close-positions
+WICHTIG – Account ist im HEDGE MODE (Two-Way):
+- Take Profit / Stop Loss auf Position: /api/v2/mix/order/place-tpsl-order
+  → planType: 'profit_plan' (TP) oder 'loss_plan' (SL), holdSide: 'long'/'short', triggerPrice, size, KEIN side/tradeSide
+- Market Order schließen (Teil): /api/v2/mix/order/place-order
+  → tradeSide: 'close', side bleibt gleich Eröffnungsseite (Long schließen=buy, Short schließen=sell)
+- Position komplett schließen: /api/v2/mix/order/close-positions
 - Plan Order canceln: /api/v2/mix/order/cancel-plan-order
 
 Häufige Fixes:
 - "order quantity too small" → size erhöhen
-- "holdSide" Fehler → Long="long", Short="short"
+- "Parameter size cannot be empty" → size aus Position hinzufügen
 - "position not exist" → close-positions
 - "plan order already triggered" → direkt market close
-- "Parameter size cannot be empty" → size aus Position hinzufügen
 
 Antworte NUR in JSON:
 {"fixDescription":"1 Satz","path":"/api/v2/...","body":{...},"skip":false}
@@ -405,6 +403,9 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskUSD) {
 
   console.log(`📐 Size: ${totalSize.toFixed(precision)} ${symbol} | Notional: $${(totalSize * price).toFixed(2)} | Risk: $${riskUSD.toFixed(2)}`);
 
+  const holdSide = direction === 'Long' ? 'long' : 'short';
+
+  // Haupt-Order (öffnen) – Hedge Mode: side=buy(Long)/sell(Short), tradeSide=open
   const mainBody = {
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
     marginCoin: 'USDT', size: totalSize.toFixed(precision),
@@ -433,23 +434,23 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskUSD) {
 
   if (validTargets.length > 0) {
     const distribution = getTPDistribution(validTargets.length);
-    const holdSide = direction === 'Long' ? 'long' : 'short';
-    const closeSide = direction === 'Long' ? 'sell' : 'buy';
 
     for (let i = 0; i < validTargets.length; i++) {
       const tp = validTargets[i];
       const tpSize = (totalSize * distribution[i] / 100).toFixed(precision);
       await new Promise(r => setTimeout(r, 800));
+
+      // TP via positionsgebundenem TPSL Endpoint (wie SL/BE) – KEIN side/tradeSide nötig
       const tpBody = {
-        symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
-        marginCoin: 'USDT', side: closeSide, holdSide,
-        tradeSide: 'close', orderType: 'market', size: tpSize,
-        triggerPrice: tp.price.toString(), triggerType: 'mark_price', planType: 'normal_plan'
+        symbol: fullSymbol, productType: 'USDT-FUTURES', marginCoin: 'USDT',
+        planType: 'profit_plan',
+        triggerPrice: tp.price.toString(), triggerType: 'mark_price',
+        holdSide: holdSide, size: tpSize
       };
-      const tpPath = '/api/v2/mix/order/place-plan-order';
+      const tpPath = '/api/v2/mix/order/place-tpsl-order';
       try {
         await axios.post(`https://api.bitget.com${tpPath}`, JSON.stringify(tpBody), { headers: bitgetHeaders(Date.now().toString(), tpPath, JSON.stringify(tpBody)) });
-        console.log(`🎯 TP${i + 1}: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%)`);
+        console.log(`🎯 TP${i + 1}: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%) [${holdSide}]`);
       } catch (e) {
         const errMsg = e.response?.data?.msg || e.message;
         console.error(`❌ TP${i + 1} Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
@@ -526,13 +527,13 @@ async function takeTp1AndBreakeven(symbol, direction) {
   }
 
   const precision = await getSizePrecision(symbol);
-  const closeSide = direction === 'Long' ? 'sell' : 'buy';
-  const holdSide = direction === 'Long' ? 'long' : 'short';
+  // Hedge Mode: zum Schließen bleibt side = Eröffnungsseite, tradeSide = close
+  const closeSide = direction === 'Long' ? 'buy' : 'sell';
 
   const closeBody = {
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
     marginCoin: 'USDT', size: parseFloat(tp1Size).toFixed(precision),
-    side: closeSide, holdSide, tradeSide: 'close', orderType: 'market'
+    side: closeSide, tradeSide: 'close', orderType: 'market'
   };
   const closePath = '/api/v2/mix/order/place-order';
   try {
@@ -570,7 +571,6 @@ async function monitorPositions() {
           const direction = trade.direction === 'Long' ? 1 : -1;
           const pnl = trade.totalSize * (currentPrice - trade.entry) * direction;
 
-          // Ehrliche Begründung statt blindes TP_FINAL
           const slHit = (currentPrice <= trade.stopLoss && trade.direction === 'Long') ||
                         (currentPrice >= trade.stopLoss && trade.direction === 'Short');
           const nearEntry = Math.abs(currentPrice - trade.entry) / trade.entry < 0.002;
@@ -624,7 +624,7 @@ async function monitorPositions() {
               await moveSlToBreakeven(asset, trade.direction, trade.entry);
               trade.beSet = true;
               trade.events.push({ time: new Date().toISOString(), type: 'AUTO_BE_SET', price: trade.entry, pnl: 0 });
-              await notify(`↔️ <b>Auto-BE gesetzt</b>\n${asset} @ $${trade.entry}\n📋 TP1 wurde getriggert, SL automatisch auf Entry`);
+              await notify(`↔️ <b>Auto-BE gesetzt</b>\n${asset} @ $${trade.entry}\n📋 TP1 getriggert, SL automatisch auf Entry`);
             } catch (e) { console.error('Auto-BE Fehler:', e.message); }
           }
 
@@ -661,12 +661,12 @@ async function analyzeSignal(text, imageUrl) {
 
 Nachricht: "${text}"
 
-Antworte NUR in JSON ohne Markdown. Füge IMMER ein "reason" Feld hinzu (1 kurzer Satz, warum du so entschieden hast).
+Antworte NUR in JSON ohne Markdown. Füge IMMER ein "reason" Feld hinzu (1 kurzer Satz).
 
 Neues Trade Signal:
 {"signal":true,"action":"open","asset":"BTC","direction":"Long","entry":67000,"stopLoss":65000,"targets":[{"price":68000},{"price":69500}],"confidence":"Hoch","reason":"..."}
 
-Market Order ohne genauen Entry ("market","CMP","current price"):
+Market Order ohne Entry ("market","CMP","current price"):
 {"signal":true,"action":"open","asset":"BTC","direction":"Long","entry":null,"stopLoss":65000,"targets":[{"price":68000}],"confidence":"Hoch","reason":"..."}
 
 Close ("close X","closing X now","exit X","out of X manually"):
@@ -682,12 +682,12 @@ Kein Signal: {"signal":false,"reason":"..."}
 
 STRIKTE REGELN:
 - NUR bei eindeutigem, direktem Command handeln. Unsicher? → signal:false
-- "TP1 here on INIT","TP1 now","taking TP1" = take_tp1_be (Trader nimmt jetzt TP1!)
+- "TP1 here on INIT","TP1 now","taking TP1" = take_tp1_be
 - "TP1 hit","TP2 hit","third TP hit" = NUR Info → signal:false
-- "stopped out","closing X in green/red","got stopped","both got inches away","gonna take" = Bericht/Ankündigung → signal:false
+- "stopped out","closing X in green/red","got stopped","both got inches away","gonna take" = Bericht → signal:false
 - Asset = erstes Coin-Wort, GROSSBUCHSTABEN
 - Alle TPs exakt aus Text/Bild, niemals erfinden
-- "market","CMP" → entry:null (NICHT als Zahl)
+- "market","CMP" → entry:null
 - Long: TPs über Entry | Short: TPs unter Entry
 - Confidence "Hoch" nur wenn SL klar erkennbar
 - reason Feld ist PFLICHT`
@@ -701,26 +701,6 @@ STRIKTE REGELN:
 
   const raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
   return JSON.parse(raw);
-}
-
-function buildTestReport(signal, entryPrice, riskUSD) {
-  if (!signal.stopLoss) return '⚠️ Kein SL';
-  const direction = signal.direction === 'Long' ? 1 : -1;
-  const riskPerUnit = Math.abs(entryPrice - signal.stopLoss);
-  const totalSize = riskUSD / riskPerUnit;
-  let report = `\n💼 <b>Berechnung</b>\nEntry: $${entryPrice.toFixed(4)}\nSize: ${totalSize.toFixed(2)} ${signal.asset}\nNotional: $${(totalSize * entryPrice).toFixed(2)}\n\n❌ SL Hit: -$${riskUSD.toFixed(2)}\n`;
-  if (signal.targets?.length > 0) {
-    const distribution = getTPDistribution(signal.targets.length);
-    let totalProfit = 0;
-    report += `\n🎯 <b>Take Profits:</b>\n`;
-    for (let i = 0; i < signal.targets.length; i++) {
-      const profit = (totalSize * distribution[i] / 100) * (signal.targets[i].price - entryPrice) * direction;
-      totalProfit += profit;
-      report += `TP${i + 1} ($${signal.targets[i].price}) ${distribution[i]}%: +$${profit.toFixed(2)}\n`;
-    }
-    report += `\n💰 <b>Gesamt: +$${totalProfit.toFixed(2)} | RR: 1:${(totalProfit / riskUSD).toFixed(2)}</b>`;
-  }
-  return report;
 }
 
 // ─── Telegram Commands (nur Basics) ────────────────────────
@@ -911,7 +891,7 @@ tg.onText(/\/d/, async (msg) => {
   } catch (e) { tg.sendMessage(msg.chat.id, '❌ Fehler.'); }
 });
 
-// ─── Callback Queries (nur Close + Manual) ─────────────────
+// ─── Callback Queries ──────────────────────────────────────
 tg.on('callback_query', async (query) => {
   const data = query.data;
 
@@ -967,7 +947,6 @@ tg.on('callback_query', async (query) => {
 tg.on('message', async (msg) => {
   if (!msg.text) return;
 
-  // Manual Trade Input
   if (manualTrade && !msg.text.startsWith('/')) {
     const chatId = manualTrade.chatId;
 
@@ -1005,7 +984,6 @@ tg.on('message', async (msg) => {
     }
   }
 
-  // Risk Input → Dollar eingeben, % vom Kontostand berechnen & speichern
   if ((waitingForRisk || waitingForTestRisk) && !msg.text.startsWith('/')) {
     const amount = parseFloat(msg.text);
     if (isNaN(amount) || amount <= 0) { tg.sendMessage(msg.chat.id, '❌ Ungültige Zahl.'); return; }
@@ -1019,7 +997,7 @@ tg.on('message', async (msg) => {
         RISK_PERCENT = parseFloat(percent.toFixed(4));
         waitingForRisk = false;
         saveSettings();
-        tg.sendMessage(msg.chat.id, `✅ <b>Live Risk gesetzt</b>\n\n$${amount.toFixed(2)} von $${equity.toFixed(2)}\n= <b>${RISK_PERCENT}%</b>\n\nKünftige Trades nutzen ${RISK_PERCENT}% vom jeweils aktuellen Kontostand. Bei wachsendem Kapital steigt die $-Risk automatisch mit.`, { parse_mode: 'HTML' });
+        tg.sendMessage(msg.chat.id, `✅ <b>Live Risk gesetzt</b>\n\n$${amount.toFixed(2)} von $${equity.toFixed(2)}\n= <b>${RISK_PERCENT}%</b>\n\nKünftige Trades nutzen ${RISK_PERCENT}% vom jeweils aktuellen Kontostand.`, { parse_mode: 'HTML' });
       } else {
         TEST_RISK_PERCENT = parseFloat(percent.toFixed(4));
         waitingForTestRisk = false;
@@ -1065,7 +1043,6 @@ client.on('messageCreate', async (message) => {
 
     if (!signal.signal) return;
 
-    // Close
     if (signal.action === 'close') {
       await closePosition(signal.asset);
       const trade = getOpenTrade(signal.asset);
@@ -1074,7 +1051,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // Breakeven
     if (signal.action === 'breakeven') {
       let entryPrice = signal.entry;
       if (!entryPrice && signal.asset) {
@@ -1089,7 +1065,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // Take TP1 + BE
     if (signal.action === 'take_tp1_be') {
       const dir = signal.direction || getOpenTrade(signal.asset)?.direction || 'Long';
       const result = await takeTp1AndBreakeven(signal.asset, dir);
@@ -1101,7 +1076,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // Open Trade
     if (signal.action === 'open') {
       if (signal.confidence === 'Niedrig' || !signal.stopLoss || !signal.asset) return;
 
@@ -1112,7 +1086,6 @@ client.on('messageCreate', async (message) => {
         return;
       }
 
-      // TP Validation – NUR wenn entry eine echte Zahl ist
       if (signal.targets && signal.entry && !isNaN(parseFloat(signal.entry))) {
         const entryRef = parseFloat(signal.entry);
         const before = signal.targets.length;
