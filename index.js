@@ -89,6 +89,7 @@ function addTrade(signal, entryPrice, totalSize, isTest = false) {
     closeReason: null,
     pnl: 0,
     beSet: false,
+    tpOrders: [],   // [{ index, size, triggerPrice, orderId, planType, taken }]
     events: []
   };
   trades.push(trade);
@@ -318,6 +319,7 @@ async function getAllPendingTrigger(fullSymbol) {
   return results;
 }
 
+// Nur TP-Orders (Profit-Seite), schließt den SL korrekt aus weil Richtung stimmt
 async function getTpOrders(fullSymbol, direction, entry) {
   const orders = await getAllPendingTrigger(fullSymbol);
   const tps = orders.filter(o => {
@@ -370,14 +372,14 @@ Fehlgeschlagener Call:
 - Aktuelle Position: ${positionContext}
 
 WICHTIG – HEDGE MODE Regeln (side = Positions-Buch, NICHT die Aktion):
-- Long-Position öffnen: side='buy', tradeSide='open'
-- Long-Position schließen: side='buy', tradeSide='close'  (side bleibt buy!)
-- Short-Position öffnen: side='sell', tradeSide='open'
-- Short-Position schließen: side='sell', tradeSide='close'  (side bleibt sell!)
-- Fehler "No position to close" (22002) = falsche side! Long schließen MUSS side='buy' sein, Short schließen side='sell'.
+- Long öffnen: side='buy', tradeSide='open'
+- Long schließen: side='buy', tradeSide='close'  (side bleibt buy!)
+- Short öffnen: side='sell', tradeSide='open'
+- Short schließen: side='sell', tradeSide='close'  (side bleibt sell!)
+- Fehler "No position to close" (22002) = falsche side! Long schließen MUSS side='buy', Short schließen side='sell'.
 
 Endpoints:
-- TP/SL auf Position: /api/v2/mix/order/place-tpsl-order (planType:'profit_plan'/'loss_plan', holdSide, triggerPrice, size)
+- TP/SL: /api/v2/mix/order/place-tpsl-order (planType:'profit_plan'/'loss_plan', holdSide, triggerPrice, size)
 - Teil-Position Market schließen: /api/v2/mix/order/place-order (tradeSide:'close', orderType:'market', size, side=Eröffnungsseite)
 - Komplett schließen: /api/v2/mix/order/close-positions
 - Plan/TPSL canceln: /api/v2/mix/order/cancel-plan-order (orderId + planType)
@@ -447,6 +449,7 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskUSD) {
   const filtered = (targets?.length || 0) - validTargets.length;
   if (filtered > 0) console.log(`⚠️ ${filtered} TP(s) gegen Live-Preis gefiltert`);
 
+  const tpOrders = [];
   if (validTargets.length > 0) {
     const distribution = getTPDistribution(validTargets.length);
 
@@ -463,17 +466,20 @@ async function placeOrder(symbol, direction, stopLoss, targets, riskUSD) {
       };
       const tpPath = '/api/v2/mix/order/place-tpsl-order';
       try {
-        await axios.post(`https://api.bitget.com${tpPath}`, JSON.stringify(tpBody), { headers: bitgetHeaders(Date.now().toString(), tpPath, JSON.stringify(tpBody)) });
-        console.log(`🎯 TP${i + 1}: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%) [${holdSide}]`);
+        const resp = await axios.post(`https://api.bitget.com${tpPath}`, JSON.stringify(tpBody), { headers: bitgetHeaders(Date.now().toString(), tpPath, JSON.stringify(tpBody)) });
+        const orderId = resp.data?.data?.orderId || resp.data?.data?.[0]?.orderId || null;
+        tpOrders.push({ index: i + 1, size: tpSize, triggerPrice: tp.price, orderId, planType: 'profit_loss', taken: false });
+        console.log(`🎯 TP${i + 1}: ${tpSize} ${symbol} @ $${tp.price} (${distribution[i]}%) [${holdSide}] | ID ${orderId}`);
       } catch (e) {
         const errMsg = e.response?.data?.msg || e.message;
         console.error(`❌ TP${i + 1} Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
         await aiRetry(`place_tp${i + 1}`, tpBody, tpPath, direction, symbol, errMsg);
+        tpOrders.push({ index: i + 1, size: tpSize, triggerPrice: tp.price, orderId: null, planType: 'profit_loss', taken: false });
       }
     }
   }
 
-  return { totalSize, price };
+  return { totalSize, price, tpOrders };
 }
 
 async function closePosition(symbol) {
@@ -504,69 +510,93 @@ async function moveSlToBreakeven(symbol, direction, entryPrice) {
   return r.data;
 }
 
-// Schließt TP1-Anteil per Market, cancelt NUR TP1, setzt BE. TP2/TP3 bleiben.
-async function takeTp1AndBreakeven(symbol, direction) {
-  const fullSymbol = symbol + 'USDT';
+// Schließt TP1-Menge per Market, cancelt GENAU die gespeicherte TP1-Order, setzt BE.
+// Richtung IMMER aus der echten Position (holdSide), nie aus dem Signal.
+async function takeTp1AndBreakeven(asset) {
+  const fullSymbol = asset + 'USDT';
   const positions = await getPositions();
   const pos = positions.find(p => p.symbol === fullSymbol);
   if (!pos) { console.log('⏭️ Keine Position für TP1'); return { noPosition: true }; }
+
+  const direction = pos.holdSide === 'long' ? 'Long' : 'Short';
   const entry = parseFloat(pos.openPriceAvg);
+  const precision = await getSizePrecision(asset);
+  const trade = getOpenTrade(asset);
 
-  const tps = await getTpOrders(fullSymbol, direction, entry);
+  // TP1 bestimmen – bevorzugt aus gespeicherten tpOrders (Disk), sonst live
+  let tp1 = null;
+  let source = '';
+  if (trade && Array.isArray(trade.tpOrders) && trade.tpOrders.length) {
+    tp1 = trade.tpOrders.find(t => !t.taken);
+    source = 'disk';
+    // Falls orderId fehlt (z.B. nach AI-Retry beim Anlegen) → aus Live nachladen
+    if (tp1 && !tp1.orderId) {
+      const live = await getTpOrders(fullSymbol, direction, entry);
+      const match = live[(tp1.index || 1) - 1];
+      if (match) { tp1.orderId = match.orderId; tp1.planType = match._planType || 'profit_loss'; }
+    }
+  }
+  if (!tp1) {
+    const live = await getTpOrders(fullSymbol, direction, entry);
+    if (live.length) {
+      tp1 = { index: 1, size: live[0].size, orderId: live[0].orderId, planType: live[0]._planType || 'profit_loss', taken: false };
+      source = 'live';
+    }
+  }
 
-  if (tps.length === 0) {
-    console.log('⏭️ Keine TP-Order gefunden, setze nur BE');
-    await moveSlToBreakeven(symbol, direction, entry);
+  if (!tp1) {
+    console.log('⏭️ Keine TP1-Order gefunden – nur BE');
+    await moveSlToBreakeven(asset, direction, entry);
     return { tp1AlreadyFilled: true, entryPrice: entry };
   }
 
-  const tp1 = tps[0];
-  const tp1Size = tp1.size;
-  const orderId = tp1.orderId;
-  const planType = tp1._planType;
-  console.log(`🎯 TP1 gefunden: ${tp1Size} @ $${tp1.triggerPrice} | ID ${orderId} | ${planType}`);
+  console.log(`🎯 TP${tp1.index || 1} (${source}): Menge ${tp1.size} | ID ${tp1.orderId} | Richtung ${direction}`);
 
-  // 1) NUR TP1 Order canceln (TP2/TP3 bleiben)
-  const cancelPath = '/api/v2/mix/order/cancel-plan-order';
-  const cancelBody = { symbol: fullSymbol, productType: 'USDT-FUTURES', marginCoin: 'USDT', orderId, planType };
-  try {
-    await axios.post(`https://api.bitget.com${cancelPath}`, JSON.stringify(cancelBody), { headers: bitgetHeaders(Date.now().toString(), cancelPath, JSON.stringify(cancelBody)) });
-    console.log(`❌ TP1 Order gecancelt (TP2/TP3 bleiben)`);
-  } catch (e) {
-    const errMsg = e.response?.data?.msg || e.message;
-    console.error(`❌ Cancel TP1 Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
-    await aiRetry('cancel_tp1', cancelBody, cancelPath, direction, symbol, errMsg);
+  // 1) GENAU diese TP-Order canceln (TP2/TP3 bleiben)
+  if (tp1.orderId) {
+    const cancelPath = '/api/v2/mix/order/cancel-plan-order';
+    const cancelBody = { symbol: fullSymbol, productType: 'USDT-FUTURES', marginCoin: 'USDT', orderId: tp1.orderId, planType: tp1.planType || 'profit_loss' };
+    try {
+      await axios.post(`https://api.bitget.com${cancelPath}`, JSON.stringify(cancelBody), { headers: bitgetHeaders(Date.now().toString(), cancelPath, JSON.stringify(cancelBody)) });
+      console.log(`❌ TP${tp1.index || 1} Order gecancelt (ID ${tp1.orderId})`);
+    } catch (e) {
+      const errMsg = e.response?.data?.msg || e.message;
+      console.error(`❌ Cancel TP Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
+      await aiRetry('cancel_tp1', cancelBody, cancelPath, direction, asset, errMsg);
+    }
+  } else {
+    console.log('⚠️ Keine orderId für TP1 – Cancel übersprungen');
   }
 
-  // 2) TP1-Anteil per Market schließen
-  // HEDGE MODE: side = Eröffnungsseite (Long schließen=buy, Short schließen=sell), tradeSide=close
+  // 2) Genau die TP1-Menge per Market schließen (Hedge: Long=buy, Short=sell)
   await new Promise(r => setTimeout(r, 800));
-  const precision = await getSizePrecision(symbol);
   const closeSide = direction === 'Long' ? 'buy' : 'sell';
   const closeBody = {
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
-    marginCoin: 'USDT', size: parseFloat(tp1Size).toFixed(precision),
+    marginCoin: 'USDT', size: parseFloat(tp1.size).toFixed(precision),
     side: closeSide, tradeSide: 'close', orderType: 'market'
   };
   const closePath = '/api/v2/mix/order/place-order';
   let closeOk = false;
   try {
     await axios.post(`https://api.bitget.com${closePath}`, JSON.stringify(closeBody), { headers: bitgetHeaders(Date.now().toString(), closePath, JSON.stringify(closeBody)) });
-    console.log(`✅ TP1-Anteil (${tp1Size}) per Market geschlossen`);
+    console.log(`✅ TP${tp1.index || 1}-Menge (${tp1.size}) per Market geschlossen`);
     closeOk = true;
   } catch (e) {
     const errMsg = e.response?.data?.msg || e.message;
-    console.error(`❌ TP1 Close Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
-    closeOk = await aiRetry('take_tp1_close', closeBody, closePath, direction, symbol, errMsg);
+    console.error(`❌ TP Close Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
+    closeOk = await aiRetry('take_tp1_close', closeBody, closePath, direction, asset, errMsg);
   }
 
-  // 3) BE setzen (auf Restposition)
-  await new Promise(r => setTimeout(r, 2000));
-  try {
-    await moveSlToBreakeven(symbol, direction, entry);
-  } catch (e) { console.error('BE nach TP1 Fehler:', e.message); }
+  // TP1 als genommen markieren (auf Disk)
+  if (trade && source === 'disk') { tp1.taken = true; saveTrades(); }
 
-  return { tp1Closed: closeOk, tp1Size, entryPrice: entry };
+  // 3) BE auf Restposition
+  await new Promise(r => setTimeout(r, 2000));
+  try { await moveSlToBreakeven(asset, direction, entry); }
+  catch (e) { console.error('BE nach TP1 Fehler:', e.message); }
+
+  return { tp1Closed: closeOk, tp1Size: tp1.size, tpIndex: tp1.index || 1, entryPrice: entry };
 }
 
 // ─── Position Monitor ──────────────────────────────────────
@@ -632,6 +662,12 @@ async function monitorPositions() {
           trade.pnl += partialPnl;
           trade.events.push({ time: new Date().toISOString(), type: `TP${tpNumber}_HIT`, price: currentPrice, pnl: parseFloat(partialPnl.toFixed(2)) });
 
+          // gehitteten TP auf Disk als taken markieren (per Index)
+          if (Array.isArray(trade.tpOrders) && typeof tpNumber === 'number') {
+            const t = trade.tpOrders.find(o => o.index === tpNumber);
+            if (t) t.taken = true;
+          }
+
           if (isTP1 && !trade.beSet) {
             try {
               await moveSlToBreakeven(asset, trade.direction, trade.entry);
@@ -689,13 +725,13 @@ Breakeven ("stops to BE","stops to break even","move stops BE","SL to entry"):
 {"signal":true,"action":"breakeven","asset":"BTC","reason":"..."}
 
 Take TP1 + BE ("TP1 here","taking TP1","manually taking TP1","take first profit","TP1 now"):
-{"signal":true,"action":"take_tp1_be","asset":"BTC","direction":"Long","reason":"..."}
+{"signal":true,"action":"take_tp1_be","asset":"BTC","reason":"..."}
 
 Kein Signal: {"signal":false,"reason":"..."}
 
 STRIKTE REGELN:
 - NUR bei eindeutigem, direktem Command handeln. Unsicher? → signal:false
-- "TP1 here on INIT","TP1 now","taking TP1" = take_tp1_be
+- "TP1 here on INIT","TP1 now","taking TP1" = take_tp1_be (KEINE direction nötig, Bot nimmt sie aus der Position)
 - "TP1 hit","TP2 hit","third TP hit" = NUR Info → signal:false
 - "stopped out","closing X in green/red","got stopped","both got inches away","gonna take" = Bericht → signal:false
 - Asset = erstes Coin-Wort, GROSSBUCHSTABEN
@@ -818,6 +854,7 @@ tg.onText(/\/trade (.+)/, (msg, match) => {
     text += `Status: ${t.status === 'open' ? '🟡 Offen' : (t.pnl > 0 ? '🟢 Win' : '🔴 Loss')}\n`;
     text += `Entry: $${t.entry} | SL: $${t.stopLoss}\n`;
     if (t.targets?.length > 0) text += `TPs: ${t.targets.map(tp => '$' + tp.price).join(' | ')}\n`;
+    if (t.tpOrders?.length > 0) text += `TP-Status: ${t.tpOrders.map(o => `TP${o.index}${o.taken ? '✅' : '⏳'}`).join(' ')}\n`;
     text += `Geöffnet: ${new Date(t.openTime).toLocaleString('de-DE')}\n`;
     if (t.closeTime) text += `Geschlossen: ${new Date(t.closeTime).toLocaleString('de-DE')}\n`;
     text += `PnL: ${t.pnl > 0 ? '+' : ''}$${t.pnl}\n`;
@@ -945,7 +982,9 @@ tg.on('callback_query', async (query) => {
         await setLeverage(d.asset);
         const { riskUSD } = await getRiskUSD(false);
         const result = await placeOrder(d.asset, d.direction, d.stopLoss, d.targets, riskUSD);
-        addTrade({ asset: d.asset, direction: d.direction, stopLoss: d.stopLoss, targets: d.targets }, result.price, result.totalSize);
+        const trade = addTrade({ asset: d.asset, direction: d.direction, stopLoss: d.stopLoss, targets: d.targets }, result.price, result.totalSize);
+        trade.tpOrders = result.tpOrders || [];
+        saveTrades();
         const tpList = d.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
         await tg.sendMessage(TELEGRAM_CHAT_ID, `🟢 <b>Manueller Trade eröffnet</b>\n${d.asset} ${d.direction}\nEntry: $${result.price}\nSL: $${d.stopLoss}\n${tpList}\nRisk: ${RISK_PERCENT}% (≈$${riskUSD.toFixed(2)})`, { parse_mode: 'HTML' });
       } catch (e) {
@@ -1072,27 +1111,25 @@ client.on('messageCreate', async (message) => {
 
     if (signal.action === 'breakeven') {
       let entryPrice = signal.entry;
-      if (!entryPrice && signal.asset) {
-        const positions = await getPositions();
-        const pos = positions.find(p => p.symbol === signal.asset + 'USDT');
-        if (pos) entryPrice = parseFloat(pos.openPriceAvg);
-      }
+      let dir = null;
+      const positions = await getPositions();
+      const pos = positions.find(p => p.symbol === signal.asset + 'USDT');
+      if (pos) { entryPrice = parseFloat(pos.openPriceAvg); dir = pos.holdSide === 'long' ? 'Long' : 'Short'; }
       if (!entryPrice) { console.log('⏭️ BE: kein Entry gefunden'); return; }
-      const dir = signal.direction || getOpenTrade(signal.asset)?.direction || 'Long';
+      if (!dir) dir = getOpenTrade(signal.asset)?.direction || 'Long';
       await moveSlToBreakeven(signal.asset, dir, entryPrice);
       await notify(`${isTest ? '🧪 ' : ''}↔️ <b>SL auf BE gesetzt</b>\n${signal.asset} @ $${entryPrice}\n📋 ${signal.reason || 'BE Signal'}`);
       return;
     }
 
     if (signal.action === 'take_tp1_be') {
-      const dir = signal.direction || getOpenTrade(signal.asset)?.direction || 'Long';
-      const result = await takeTp1AndBreakeven(signal.asset, dir);
+      const result = await takeTp1AndBreakeven(signal.asset);
       if (result.noPosition) {
         await notify(`${isTest ? '🧪 ' : ''}⚠️ <b>Keine offene Position</b>\n${signal.asset}`);
       } else if (result.tp1AlreadyFilled) {
         await notify(`${isTest ? '🧪 ' : ''}↔️ <b>Keine TP1-Order gefunden – nur BE gesetzt</b>\n${signal.asset}\n📋 ${signal.reason || ''}`);
       } else if (result.tp1Closed) {
-        await notify(`${isTest ? '🧪 ' : ''}✅ <b>TP1 geschlossen + BE gesetzt</b>\n${signal.asset} | ${result.tp1Size} Units\nTP2/TP3 laufen weiter\n📋 ${signal.reason || ''}`);
+        await notify(`${isTest ? '🧪 ' : ''}✅ <b>TP${result.tpIndex} geschlossen + BE gesetzt</b>\n${signal.asset} | ${result.tp1Size} Units\nRestliche TPs laufen weiter\n📋 ${signal.reason || ''}`);
       } else {
         await notify(`${isTest ? '🧪 ' : ''}⚠️ <b>TP1 Close fehlgeschlagen – BE trotzdem gesetzt</b>\n${signal.asset}`);
       }
@@ -1124,9 +1161,11 @@ client.on('messageCreate', async (message) => {
 
       await setLeverage(signal.asset);
       const result = await placeOrder(signal.asset, signal.direction, signal.stopLoss, signal.targets, riskUSD);
-      addTrade(signal, result.price, result.totalSize, isTest);
+      const trade = addTrade(signal, result.price, result.totalSize, isTest);
+      trade.tpOrders = result.tpOrders || [];
+      saveTrades();
 
-      const tpList = signal.targets?.map((t, i) => `TP${i + 1}: $${t.price}`).join('\n') || '–';
+      const tpList = (result.tpOrders || []).map(o => `TP${o.index}: ${o.size} @ $${o.triggerPrice}`).join('\n') || '–';
       await notify(`${isTest ? '🧪 ' : ''}🟢 <b>Trade eröffnet</b>\nAsset: ${signal.asset} ${signal.direction}\nEntry: $${result.price}\nSL: $${signal.stopLoss}\n${tpList}\nRisk: ${percent}% (≈$${riskUSD.toFixed(2)} von $${equity.toFixed(2)})`);
     }
 
