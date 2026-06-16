@@ -304,15 +304,32 @@ async function getPositions() {
   return r.data.data.filter(p => parseFloat(p.total) > 0);
 }
 
-async function getPlanOrders(fullSymbol) {
-  try {
-    const timestamp = Date.now().toString();
-    const path = '/api/v2/mix/order/orders-plan-pending';
-    const queryString = `?symbol=${fullSymbol}&productType=USDT-FUTURES`;
-    const r = await axios.get(`https://api.bitget.com${path}${queryString}`, { headers: bitgetGetHeaders(timestamp, path, queryString) });
-    const orders = r.data.data?.entrustedList || r.data.data || [];
-    return orders.sort((a, b) => parseFloat(a.triggerPrice) - parseFloat(b.triggerPrice));
-  } catch (e) { return []; }
+// Holt ALLE offenen Trigger-Orders (TP/SL via profit_loss UND normale plan orders)
+async function getAllPendingTrigger(fullSymbol) {
+  const results = [];
+  for (const pt of ['profit_loss', 'normal_plan']) {
+    try {
+      const path = '/api/v2/mix/order/orders-plan-pending';
+      const qs = `?symbol=${fullSymbol}&productType=USDT-FUTURES&planType=${pt}`;
+      const r = await axios.get(`https://api.bitget.com${path}${qs}`, { headers: bitgetGetHeaders(Date.now().toString(), path, qs) });
+      const list = r.data.data?.entrustedList || r.data.data || [];
+      for (const o of list) results.push({ ...o, _planType: pt });
+    } catch (e) { /* still */ }
+  }
+  return results;
+}
+
+// Liefert nur die TP-Orders (Profit-Seite) sortiert: TP1 zuerst
+async function getTpOrders(fullSymbol, direction, entry) {
+  const orders = await getAllPendingTrigger(fullSymbol);
+  const tps = orders.filter(o => {
+    const tp = parseFloat(o.triggerPrice);
+    return direction === 'Long' ? tp > entry : tp < entry;
+  });
+  tps.sort((a, b) => direction === 'Long'
+    ? parseFloat(a.triggerPrice) - parseFloat(b.triggerPrice)
+    : parseFloat(b.triggerPrice) - parseFloat(a.triggerPrice));
+  return tps;
 }
 
 async function setLeverage(symbol) {
@@ -354,19 +371,13 @@ Fehlgeschlagener Call:
 - Direction: ${direction}
 - Aktuelle Position: ${positionContext}
 
-WICHTIG – Account ist im HEDGE MODE (Two-Way):
+WICHTIG – HEDGE MODE (Two-Way):
 - TP/SL auf Position: /api/v2/mix/order/place-tpsl-order
-  → planType: 'profit_plan' (TP) oder 'loss_plan' (SL), holdSide: 'long'/'short', triggerPrice, size, KEIN side/tradeSide
-- Market Order schließen (Teil): /api/v2/mix/order/place-order
-  → tradeSide: 'close', side = Eröffnungsseite (Long schließen=buy, Short schließen=sell)
-- Position komplett schließen: /api/v2/mix/order/close-positions
-- Plan Order canceln: /api/v2/mix/order/cancel-plan-order
-
-Häufige Fixes:
-- "order quantity too small" → size erhöhen
-- "Parameter size cannot be empty" → size aus Position hinzufügen
-- "position not exist" → close-positions
-- "plan order already triggered" → direkt market close
+  → planType: 'profit_plan'(TP)/'loss_plan'(SL), holdSide:'long'/'short', triggerPrice, size, KEIN side/tradeSide
+- Teil-Position per Market schließen: /api/v2/mix/order/place-order
+  → tradeSide:'close', orderType:'market', size. Side: Long schließen=sell, Short schließen=buy
+- Komplett schließen: /api/v2/mix/order/close-positions
+- Plan/TPSL Order canceln: /api/v2/mix/order/cancel-plan-order (mit orderId + planType)
 
 Antworte NUR mit reinem JSON, kein Text davor/danach:
 {"fixDescription":"1 Satz","path":"/api/v2/...","body":{...},"skip":false}
@@ -490,45 +501,45 @@ async function moveSlToBreakeven(symbol, direction, entryPrice) {
   return r.data;
 }
 
+// Schließt TP1-Anteil per Market, cancelt NUR TP1, setzt BE. TP2/TP3 bleiben.
 async function takeTp1AndBreakeven(symbol, direction) {
   const fullSymbol = symbol + 'USDT';
-  const planOrders = await getPlanOrders(fullSymbol);
+  const positions = await getPositions();
+  const pos = positions.find(p => p.symbol === fullSymbol);
+  if (!pos) { console.log('⏭️ Keine Position für TP1'); return { noPosition: true }; }
+  const entry = parseFloat(pos.openPriceAvg);
 
-  if (planOrders.length === 0) {
-    const positions = await getPositions();
-    const position = positions.find(p => p.symbol === fullSymbol);
-    if (position) {
-      const entryPrice = parseFloat(position.openPriceAvg);
-      await moveSlToBreakeven(symbol, direction, entryPrice);
-      return { tp1AlreadyFilled: true, entryPrice };
-    }
-    return { tp1AlreadyFilled: true };
+  const tps = await getTpOrders(fullSymbol, direction, entry);
+
+  if (tps.length === 0) {
+    // Keine TP-Order gefunden → nur BE setzen
+    console.log('⏭️ Keine TP-Order gefunden, setze nur BE');
+    await moveSlToBreakeven(symbol, direction, entry);
+    return { tp1AlreadyFilled: true, entryPrice: entry };
   }
 
-  const sorted = [...planOrders].sort((a, b) => {
-    const pA = parseFloat(a.triggerPrice), pB = parseFloat(b.triggerPrice);
-    return direction === 'Long' ? pA - pB : pB - pA;
-  });
+  const tp1 = tps[0];
+  const tp1Size = tp1.size;
+  const orderId = tp1.orderId;
+  const planType = tp1._planType;
+  console.log(`🎯 TP1 gefunden: ${tp1Size} @ $${tp1.triggerPrice} | ID ${orderId} | ${planType}`);
 
-  const tp1Order = sorted[0];
-  const tp1Size = tp1Order.size;
-  const orderId = tp1Order.orderId;
-  console.log(`🎯 TP1 gefunden: ${tp1Size} @ $${tp1Order.triggerPrice} | ID: ${orderId}`);
-
+  // 1) NUR TP1 Order canceln (TP2/TP3 bleiben)
   const cancelPath = '/api/v2/mix/order/cancel-plan-order';
-  const cancelBody = { symbol: fullSymbol, productType: 'USDT-FUTURES', marginCoin: 'USDT', orderId };
+  const cancelBody = { symbol: fullSymbol, productType: 'USDT-FUTURES', marginCoin: 'USDT', orderId, planType };
   try {
     await axios.post(`https://api.bitget.com${cancelPath}`, JSON.stringify(cancelBody), { headers: bitgetHeaders(Date.now().toString(), cancelPath, JSON.stringify(cancelBody)) });
-    console.log(`❌ TP1 Order gecancelt`);
+    console.log(`❌ TP1 Order gecancelt (TP2/TP3 bleiben)`);
   } catch (e) {
     const errMsg = e.response?.data?.msg || e.message;
-    console.error(`❌ Cancel TP1 Fehler: ${errMsg}`);
+    console.error(`❌ Cancel TP1 Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
     await aiRetry('cancel_tp1', cancelBody, cancelPath, direction, symbol, errMsg);
   }
 
+  // 2) TP1-Anteil per Market schließen (Hedge: Long schließen=sell, Short schließen=buy)
+  await new Promise(r => setTimeout(r, 800));
   const precision = await getSizePrecision(symbol);
-  const closeSide = direction === 'Long' ? 'buy' : 'sell';
-
+  const closeSide = direction === 'Long' ? 'sell' : 'buy';
   const closeBody = {
     symbol: fullSymbol, productType: 'USDT-FUTURES', marginMode: 'isolated',
     marginCoin: 'USDT', size: parseFloat(tp1Size).toFixed(precision),
@@ -537,22 +548,20 @@ async function takeTp1AndBreakeven(symbol, direction) {
   const closePath = '/api/v2/mix/order/place-order';
   try {
     await axios.post(`https://api.bitget.com${closePath}`, JSON.stringify(closeBody), { headers: bitgetHeaders(Date.now().toString(), closePath, JSON.stringify(closeBody)) });
-    console.log(`✅ TP1 at Market geschlossen`);
+    console.log(`✅ TP1-Anteil (${tp1Size}) per Market geschlossen`);
   } catch (e) {
     const errMsg = e.response?.data?.msg || e.message;
-    console.error(`❌ TP1 Close Fehler: ${errMsg}`);
+    console.error(`❌ TP1 Close Fehler: ${errMsg}`, JSON.stringify(e.response?.data));
     await aiRetry('take_tp1_close', closeBody, closePath, direction, symbol, errMsg);
   }
 
+  // 3) BE setzen (auf Restposition)
   await new Promise(r => setTimeout(r, 2000));
-  const positions = await getPositions();
-  const position = positions.find(p => p.symbol === fullSymbol);
-  if (position) {
-    const entryPrice = parseFloat(position.openPriceAvg);
-    await moveSlToBreakeven(symbol, direction, entryPrice);
-    return { tp1Closed: true, tp1Size, entryPrice };
-  }
-  return { tp1Closed: true, tp1Size };
+  try {
+    await moveSlToBreakeven(symbol, direction, entry);
+  } catch (e) { console.error('BE nach TP1 Fehler:', e.message); }
+
+  return { tp1Closed: true, tp1Size, entryPrice: entry };
 }
 
 // ─── Position Monitor ──────────────────────────────────────
@@ -660,7 +669,7 @@ async function analyzeSignal(text, imageUrl) {
 
 Nachricht: "${text}"
 
-Antworte AUSSCHLIESSLICH mit reinem JSON. KEIN Text davor, KEINE Erklärung, KEIN "Analyzing", KEINE Markdown-Backticks. Beginne deine Antwort direkt mit { und beende sie mit }. Füge IMMER ein "reason" Feld hinzu (1 kurzer Satz).
+Antworte AUSSCHLIESSLICH mit reinem JSON. KEIN Text davor, KEINE Erklärung, KEIN "Analyzing", KEINE Markdown-Backticks. Beginne direkt mit { und beende mit }. Füge IMMER ein "reason" Feld hinzu (1 kurzer Satz).
 
 Neues Trade Signal:
 {"signal":true,"action":"open","asset":"BTC","direction":"Long","entry":67000,"stopLoss":65000,"targets":[{"price":68000},{"price":69500}],"confidence":"Hoch","reason":"..."}
@@ -698,7 +707,6 @@ STRIKTE REGELN:
     messages: [{ role: 'user', content }]
   }, { headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
 
-  // JSON robust rausschneiden, falls Claude Text davor/danach schreibt
   let raw = response.data.content[0].text.replace(/```json|```/g, '').trim();
   const firstBrace = raw.indexOf('{');
   const lastBrace = raw.lastIndexOf('}');
@@ -749,22 +757,16 @@ tg.onText(/\/positions/, async (msg) => {
       const pnl = parseFloat(p.unrealizedPL);
       const rl = parseFloat(p.achievedProfits || 0);
       const isLong = p.holdSide === 'long';
+      const entry = parseFloat(p.openPriceAvg);
       const trade = getOpenTrade(asset);
 
-      const planOrders = await getPlanOrders(p.symbol);
-      let tpText = '';
-      if (planOrders.length > 0) {
-        const sorted = [...planOrders].sort((a, b) =>
-          isLong ? parseFloat(a.triggerPrice) - parseFloat(b.triggerPrice)
-                 : parseFloat(b.triggerPrice) - parseFloat(a.triggerPrice)
-        );
-        tpText = sorted.map((o, i) => `TP${i + 1}: $${parseFloat(o.triggerPrice).toFixed(4)}`).join('\n');
-      } else {
-        tpText = '— (keine TPs)';
-      }
+      const tps = await getTpOrders(p.symbol, isLong ? 'Long' : 'Short', entry);
+      let tpText = tps.length > 0
+        ? tps.map((o, i) => `TP${i + 1}: $${parseFloat(o.triggerPrice).toFixed(4)}`).join('\n')
+        : '— (keine TPs)';
 
       const text = `${isLong ? '🟢 Long' : '🔴 Short'} <b>${p.symbol}</b>
-Entry: $${parseFloat(p.openPriceAvg).toFixed(4)}
+Entry: $${entry.toFixed(4)}
 SL: $${trade?.stopLoss || '—'}
 ${tpText}
 ─────────────
@@ -1080,10 +1082,12 @@ client.on('messageCreate', async (message) => {
     if (signal.action === 'take_tp1_be') {
       const dir = signal.direction || getOpenTrade(signal.asset)?.direction || 'Long';
       const result = await takeTp1AndBreakeven(signal.asset, dir);
-      if (result.tp1AlreadyFilled) {
-        await notify(`${isTest ? '🧪 ' : ''}↔️ <b>TP1 bereits getriggert – BE gesetzt</b>\n${signal.asset}\n📋 ${signal.reason || ''}`);
+      if (result.noPosition) {
+        await notify(`${isTest ? '🧪 ' : ''}⚠️ <b>Keine offene Position</b>\n${signal.asset}`);
+      } else if (result.tp1AlreadyFilled) {
+        await notify(`${isTest ? '🧪 ' : ''}↔️ <b>Keine TP1-Order gefunden – nur BE gesetzt</b>\n${signal.asset}\n📋 ${signal.reason || ''}`);
       } else {
-        await notify(`${isTest ? '🧪 ' : ''}✅ <b>TP1 geschlossen + BE gesetzt</b>\n${signal.asset} | ${result.tp1Size} Units\n📋 ${signal.reason || ''}`);
+        await notify(`${isTest ? '🧪 ' : ''}✅ <b>TP1 geschlossen + BE gesetzt</b>\n${signal.asset} | ${result.tp1Size} Units\nTP2/TP3 laufen weiter\n📋 ${signal.reason || ''}`);
       }
       return;
     }
